@@ -302,6 +302,11 @@ export class Bitrix24Client {
     extranetSupport = false,
     eventHandler,
   }: RegisterCommandOptions): Promise<number> {
+    // EVENT_COMMAND_ADD is required by Bitrix24 API
+    if (!eventHandler) {
+      throw new Error("eventHandler (EVENT_COMMAND_ADD) is required for command registration");
+    }
+
     // Build LANG array for API
     const langParams: Record<string, string> = {};
     lang.forEach((l, i) => {
@@ -318,12 +323,9 @@ export class Bitrix24Client {
       COMMON: common ? "Y" : "N",
       HIDDEN: hidden ? "Y" : "N",
       EXTRANET_SUPPORT: extranetSupport ? "Y" : "N",
+      EVENT_COMMAND_ADD: eventHandler,
       ...langParams,
     };
-
-    if (eventHandler) {
-      params.EVENT_COMMAND_ADD = eventHandler;
-    }
 
     if (this.clientId) {
       params.CLIENT_ID = this.clientId;

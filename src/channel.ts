@@ -296,21 +296,40 @@ export const bitrix24Plugin: ChannelPlugin<ResolvedBitrix24Account> = {
               log: ctx.log || getBitrix24Runtime().logging,
             });
 
-            ctx.log?.info(`[${account.accountId}] Registering ${account.customCommands.length} custom commands...`);
+            // Build webhook URL for command events
+            // Priority: explicit webhookUrl config > gateway publicUrl > gateway remote url
+            let webhookUrl = bitrix24Config?.webhookUrl;
+            if (!webhookUrl) {
+              const gatewayUrl = (cfg.gateway as any)?.publicUrl || (cfg.gateway as any)?.remote?.url?.replace("wws://", "https://").replace("ws://", "http://");
+              webhookUrl = gatewayUrl
+                ? `${gatewayUrl}/chan/bitrix24/webhook?secret=${account.webhookSecret}`
+                : undefined;
+            } else if (!webhookUrl.includes("secret=")) {
+              // Append secret if not already in URL
+              webhookUrl = `${webhookUrl}${webhookUrl.includes("?") ? "&" : "?"}secret=${account.webhookSecret}`;
+            }
 
-            for (const cmd of account.customCommands) {
-              try {
-                const lang = buildCommandLang(cmd);
-                await client.registerCommand({
-                  command: cmd.command,
-                  lang,
-                  common: cmd.common,
-                  hidden: cmd.hidden,
-                });
-                ctx.log?.info(`[${account.accountId}] Registered command /${cmd.command}`);
-              } catch (cmdErr) {
-                // Command might already be registered, log and continue
-                ctx.log?.warn?.(`[${account.accountId}] Failed to register /${cmd.command}: ${String(cmdErr)}`);
+            if (!webhookUrl) {
+              ctx.log?.warn?.(`[${account.accountId}] Cannot register commands: no public gateway URL configured`);
+            } else {
+              ctx.log?.info(`[${account.accountId}] Registering ${account.customCommands.length} custom commands...`);
+              ctx.log?.info(`[${account.accountId}] Webhook URL: ${webhookUrl}`);
+
+              for (const cmd of account.customCommands) {
+                try {
+                  const lang = buildCommandLang(cmd);
+                  await client.registerCommand({
+                    command: cmd.command,
+                    lang,
+                    common: cmd.common,
+                    hidden: cmd.hidden,
+                    eventHandler: webhookUrl,
+                  });
+                  ctx.log?.info(`[${account.accountId}] Registered command /${cmd.command}`);
+                } catch (cmdErr) {
+                  // Command might already be registered, log and continue
+                  ctx.log?.warn?.(`[${account.accountId}] Failed to register /${cmd.command}: ${String(cmdErr)}`);
+                }
               }
             }
           } catch (err) {

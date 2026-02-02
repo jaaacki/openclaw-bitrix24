@@ -43,6 +43,7 @@ export const Bitrix24ConfigSchema = z.object({
   // Commands configuration
   customCommands: z.array(Bitrix24CommandSchema).optional(),
   registerCommandsOnStartup: z.boolean().optional(), // Auto-register commands
+  webhookUrl: z.string().url().optional(), // Public URL for command webhook (e.g., https://openclaw.example.com/chan/bitrix24/webhook)
 });
 
 export type Bitrix24Config = z.infer<typeof Bitrix24ConfigSchema>;
