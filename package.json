@@ -1,9 +1,10 @@
 {
   "name": "openclaw-bitrix24",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Bitrix24 connector plugin for OpenClaw - enables two-way messaging between OpenClaw and Bitrix24 chat",
-  "main": "src/index.js",
-  "types": "src/index.d.ts",
+  "type": "module",
+  "main": "index.ts",
+  "types": "index.ts",
   "keywords": [
     "openclaw",
     "bitrix24",
@@ -11,7 +12,8 @@
     "plugin",
     "messaging",
     "webhook",
-    "bot"
+    "bot",
+    "channel"
   ],
   "author": "Jacki Ng <jaaacki@users.noreply.github.com>",
   "license": "MIT",
@@ -26,7 +28,11 @@
   "peerDependencies": {
     "openclaw": "^2026.1.0"
   },
+  "dependencies": {
+    "zod": "^4.3.0"
+  },
   "files": [
+    "index.ts",
     "src/",
     "LICENSE",
     "README.md"
@@ -35,7 +41,15 @@
     "node": ">=18.0.0"
   },
   "scripts": {
-    "test": "echo \"Run: npm install -g jest && jest\"",
-    "lint": "echo \"Run: npm install -g eslint && eslint src/\""
+    "test": "echo \"Tests not yet implemented\"",
+    "lint": "echo \"Linting not yet configured\""
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
   }
 }

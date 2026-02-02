@@ -1,11 +1,40 @@
 # openclaw-bitrix24
 
-Bitrix24 connector plugin for OpenClaw - enables two-way messaging between OpenClaw and Bitrix24 chat.
+Bitrix24 channel plugin for OpenClaw - enables two-way messaging between OpenClaw and Bitrix24 chat.
+
+## Features
+
+- ✅ Two-way messaging (send & receive)
+- ✅ Webhook-based message reception
+- ✅ Markdown to BBCode conversion (bold, italic, links, code blocks, etc.)
+- ✅ Smart URL detection (handles URLs in brackets correctly)
+- ✅ File upload/download
+- ✅ Bot commands
+- ✅ Group & direct messages
+- ✅ Multi-domain support
+- ✅ Policy controls
+- ✅ Rate limiting
+- ✅ Error handling & retry
 
 ## Installation
 
+### Prerequisites
+
+- OpenClaw 2026.1.0 or higher
+- Node.js 18.0.0 or higher
+
+### From Local Directory
+
 ```bash
-npm install openclaw-bitrix24
+cd ~/Dev/openclaw-bitrix24
+npm install
+openclaw plugins install .
+```
+
+### From npm (when published)
+
+```bash
+openclaw plugins install openclaw-bitrix24
 ```
 
 ## Configuration
@@ -17,10 +46,51 @@ Add to your OpenClaw `openclaw.json`:
   "channels": {
     "bitrix24": {
       "enabled": true,
-      "domains": ["yourcompany.bitrix24.com"],
+      "domain": "yourcompany.bitrix24.com",
       "webhookSecret": "your-webhook-secret-token",
-      "dmPolicy": "pairing",
-      "groupPolicy": "allowlist"
+      "userId": "1",
+      "dmPolicy": "open"
+    }
+  }
+}
+```
+
+### Configuration Options
+
+| Option | Type | Required | Description |
+|--------|------|----------|-------------|
+| `enabled` | boolean | Yes | Enable/disable the plugin |
+| `domain` | string | Yes | Your Bitrix24 domain (e.g., `company.bitrix24.com`) |
+| `webhookSecret` | string | Yes | Webhook secret token for verification |
+| `userId` | string | Yes | Your Bitrix24 bot/user ID |
+| `dmPolicy` | string | No | Direct message policy (`open`, `pairing`, `block`) |
+| `mediaMaxMb` | number | No | Maximum media size in MB (default: 50) |
+
+### Multiple Accounts
+
+For multiple Bitrix24 domains:
+
+```json
+{
+  "channels": {
+    "bitrix24": {
+      "enabled": true,
+      "accounts": {
+        "company1": {
+          "enabled": true,
+          "name": "Company 1",
+          "domain": "company1.bitrix24.com",
+          "webhookSecret": "secret1",
+          "userId": "1"
+        },
+        "company2": {
+          "enabled": true,
+          "name": "Company 2",
+          "domain": "company2.bitrix24.com",
+          "webhookSecret": "secret2",
+          "userId": "1"
+        }
+      }
     }
   }
 }
@@ -28,78 +98,236 @@ Add to your OpenClaw `openclaw.json`:
 
 ## Bitrix24 Setup
 
-### 1. Register Your Bot
+### 1. Create a Bot in Bitrix24
+
+#### Option A: Via Interface
 
 1. Go to your Bitrix24: `https://yourcompany.bitrix24.com`
-2. Navigate to Intranet → Services → Rest API
-3. Create an **Inbound Webhook**:
-   - Note the OAuth token
-   - Note the webhook URL
+2. Navigate to **Intranet → Services → Bots**
+3. Click **"Add Bot"**
+4. Fill in bot name, avatar, and description
+5. Save - you'll get the bot ID
 
-### 2. Configure Webhook
+#### Option B: Via REST API
 
-The plugin will automatically register the webhook with Bitrix24 once configured.
+1. Go to **Intranet → Services → Rest API**
+2. Create a **New Inbound Webhook**
+3. Select **"Bot"** as the application type
+4. Note the **OAuth token** and **webhook URL**
 
-### 3. Start Messaging
+### 2. Configure Your Bot
 
-Once configured, you can:
+Use the Bitrix24 REST API to configure your bot:
 
-- Send messages to Bitrix24 channels
-- Receive messages from Bitrix24
-- Use bot commands (`/command`)
-- Share files and attachments
-- Manage group and direct messages
+```bash
+curl -X POST "https://yourcompany.bitrix24.com/rest/imbot.bot.add" \
+  -H "Content-Type: application/json" \
+  -d "{
+    'CODE': 'my_bot_code',
+    'EVENT_HANDLER': 'https://your-openclaw-domain.com/chan/bitrix24/webhook',
+    'EVENT_MESSAGE_ADD': 'Y',
+    'EVENT_WELCOME_MESSAGE': 'Y',
+    'EVENT_BOT_DELETE': 'Y',
+    'OPEN_LINES': 'N'
+  }"
+```
 
-## Features
+### 3. Enable Webhook Events
 
-- ✅ Two-way messaging (send & receive)
-- ✅ File upload/download
-- ✅ Bot commands
-- ✅ Group & direct messages
-- ✅ Multi-domain support
-- ✅ Policy controls
-- ✅ Rate limiting
-- ✅ Error handling & retry
+Configure which events your bot should receive:
 
-## Usage Examples
+- `EVENT_MESSAGE_ADD` - Receive new messages
+- `EVENT_WELCOME_MESSAGE` - Welcome new users
+- `EVENT_BOT_DELETE` - Handle bot deletions
+- `OPEN_LINES` - Open lines support (optional)
+
+### 4. Test the Webhook
+
+Once configured, test your webhook with a simple curl:
+
+```bash
+curl -X POST "https://your-openclaw-domain.com/chan/bitrix24/webhook" \
+  -H "Content-Type: application/json" \
+  -d "{
+    'event': 'ONIMMESSAGEADD',
+    'data': {
+      'AUTHOR_ID': '123',
+      'MESSAGE': 'Test from Bitrix24',
+      'MESSAGE_ID': '456'
+    }
+  }"
+```
+
+You should receive: `{"success":true}`
+
+## Usage
 
 ### Send Message
 
-```javascript
-// Through OpenClaw
-await sendMessage({
+From OpenClaw:
+
+```typescript
+await message.send({
   channel: 'bitrix24',
-  target: 'user@example.com',
-  message: 'Hello from OpenClaw!'
+  target: '123', // Bitrix24 user ID
+  message: 'Hello from OpenClaw!',
 });
 ```
 
 ### Receive Message
 
-Messages from Bitrix24 are automatically routed to OpenClaw for processing.
+Messages from Bitrix24 are automatically routed to OpenClaw and delivered to your configured agents.
+
+### Support Multiple Domains
+
+When using multiple accounts, include the domain in the target:
+
+```typescript
+await message.send({
+  channel: 'bitrix24',
+  target: 'company1.bitrix24.com/123', // domain/userId format
+  message: 'Hello to company1!',
+});
+```
+
+## Webhook URL
+
+The plugin automatically registers the webhook endpoint at:
+
+```
+https://{your-gateway-hostname}/chan/bitrix24/webhook
+```
+
+For example, if your cloudflared tunnel is configured as `openclaw.noonoon.cc`:
+
+```
+https://openclaw.noonoon.cc/chan/bitrix24/webhook
+```
+
+### Public Webhook Requirement
+
+Bitrix24 requires a **publicly accessible webhook URL**. If you're running OpenClaw locally:
+
+1. **Cloudflare Tunnel** - Recommended (as shown in the summary)
+2. **ngrok** - Temporary testing: `ngrok http 18789`
+3. **Port forwarding** - Forward port 18789 on your router
 
 ## Troubleshooting
 
 ### Webhook Not Receiving Events
 
-- Verify webhook URL is publicly accessible
-- Check Bitrix24 webhook logs
-- Ensure webhook secret matches configuration
+**Check gateway is running:**
+```bash
+openclaw gateway status
+```
+
+**Verify webhook URL is publicly accessible:**
+```bash
+curl -X POST "https://openclaw.noonoon.cc/chan/bitrix24/webhook" \
+  -H "Content-Type: application/json" \
+  -d '{"event":"test","data":{}}'
+```
+
+**Check OpenClaw logs:**
+```bash
+openclaw doctor --non-interactive
+```
+
+**Verify Bitrix24 webhook configuration:**
+- Check the webhook URL matches exactly
+- Verify webhook secret (if configured)
+- Ensure "Receive messages" event is enabled
 
 ### Rate Limiting
 
-The connector includes conservative rate limiting (1 msg/sec default). Adjust if needed.
+The connector includes conservative rate limiting (1 req/sec default). To adjust:
+
+1. Open `src/client.ts`
+2. Modify `this.rateLimit.minWait` (1000 = 1 second)
+3. Reinstall the plugin
 
 ### Configuration Issues
 
-Check OpenClaw logs: `openclaw doctor --non-interactive`
+**Check plugin is installed:**
+```bash
+openclaw plugins list
+```
+
+**Check configuration is valid:**
+```bash
+cat ~/.openclaw/openclaw.json | jq '.channels.bitrix24'
+```
+
+**Restart gateway after config changes:**
+```bash
+openclaw gateway restart
+```
+
+### Message Not Sending
+
+1. Check user ID is correct (must be numeric string, e.g., "123")
+2. Verify webhook secret in config matches Bitrix24
+3. Check logs with `openclaw doctor --non-interactive`
+4. Bot must be added to the conversation in Bitrix24
+
+## Architecture
+
+### Outbound Flow
+```
+Agent → OpenClaw → Bitrix24Client → Bitrix24 REST API → User
+```
+
+### Inbound Flow
+```
+User → Bitrix24 → Webhook → /chan/bitrix24/webhook → OpenClaw → Agent
+```
+
+### Event Types
+
+| Event | Description | Supported |
+|-------|-------------|-----------|
+| ONIMMESSAGEADD | New message received | ✅ |
+| ONIMCOMMANDADD | Bot command received | ✅ |
+| ONIMBOTDELETE | Bot deleted | ⚠️ (logged) |
+| Other events | Logging/notification | ⚠️ (logged) |
+
+## Development
+
+### Install Dependencies
+
+```bash
+npm install
+```
+
+### Build TypeScript
+
+```bash
+npx tsc
+```
+
+### Local Testing
+
+```bash
+openclaw plugins install .
+
+# Check logs
+tail -f ~/.openclaw/logs/gateway.log
+
+# Test webhook
+curl -X POST http://localhost:18789/chan/bitrix24/webhook \
+  -H "Content-Type: application/json" \
+  -d '{"event":"ONIMMESSAGEADD","data":{"AUTHOR_ID":"123","MESSAGE":"test"}}'
+```
 
 ## Roadmap
 
-- [ ] Initial release (v0.1.0)
-- [ ] File attachments
-- [ ] Custom keyboards
-- [ ] Mentions parsing
+- [x] Basic two-way messaging
+- [x] Webhook receiver
+- [x] Bot command support
+- [ ] File attachment upload (multipart)
+- [ ] Custom keyboards/buttons
+- [ ] Mentions parsing (@username)
+- [ ] Thread/conversation support
 - [ ] Extended logging
 - [ ] v1.0.0 stable release
 
@@ -114,5 +342,7 @@ MIT - see [LICENSE](LICENSE) file.
 ## Links
 
 - [OpenClaw](https://github.com/openclaw/openclaw)
-- [Bitrix24 API Docs](https://dev.1c-bitrix.ru/rest_help/)
+- [Bitrix24 REST API Docs](https://dev.1c-bitrix.ru/rest_help/)
+- [IM Bot API](https://dev.1c-bitrix.ru/rest_help/imapp/bot/)
 - [Issues](https://github.com/jaaacki/openclaw-bitrix24/issues)
+- [Discussions](https://github.com/jaaacki/openclaw-bitrix24/discussions)
