@@ -1,0 +1,22 @@
+{
+  "channels": {
+    "bitrix24": {
+      "enabled": true,
+      "domains": [
+        "yourcompany.bitrix24.com",
+        "anothercompany.bitrix24.com"
+      ],
+      "webhookSecret": "your-webhook-secret-token-here",
+      "dmPolicy": "pairing",
+      "groupPolicy": "allowlist",
+      "streamMode": "partial"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "anthropic/claude-sonnet-4-5"
+      }
+    }
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "name": "openclaw-bitrix24",
+  "version": "0.1.0",
+  "description": "Bitrix24 connector plugin for OpenClaw - enables two-way messaging between OpenClaw and Bitrix24 chat",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "keywords": [
+    "openclaw",
+    "bitrix24",
+    "connector",
+    "plugin",
+    "messaging",
+    "webhook",
+    "bot"
+  ],
+  "author": "Jacki Ng <jaaacki@users.noreply.github.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jaaacki/openclaw-bitrix24.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jaaacki/openclaw-bitrix24/issues"
+  },
+  "homepage": "https://github.com/jaaacki/openclaw-bitrix24#readme",
+  "peerDependencies": {
+    "openclaw": "^2026.1.0"
+  },
+  "files": [
+    "src/",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "test": "echo \"Run: npm install -g jest && jest\"",
+    "lint": "echo \"Run: npm install -g eslint && eslint src/\""
+  }
+}
