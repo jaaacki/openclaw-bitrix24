@@ -64,8 +64,12 @@ Add to your OpenClaw `openclaw.json`:
 | `domain` | string | Yes | Your Bitrix24 domain (e.g., `company.bitrix24.com`) |
 | `webhookSecret` | string | Yes | Webhook secret token for verification |
 | `userId` | string | Yes | Your Bitrix24 bot/user ID |
-| `dmPolicy` | string | No | Direct message policy (`open`, `pairing`, `block`) |
-| `mediaMaxMb` | number | No | Maximum media size in MB (default: 50) |
+| `dmPolicy` | string | No | Direct message policy (`open`, `pairing`, `allowlist`) |
+| `botId` | string | No | Bot ID for command registration |
+| `clientId` | string | No | Application token for bot API calls |
+| `webhookUrl` | string | No | Public URL for command webhook (required for commands) |
+| `registerCommandsOnStartup` | boolean | No | Auto-register commands on startup |
+| `customCommands` | array | No | Array of custom command definitions |
 
 ### Multiple Accounts
 
@@ -110,6 +114,8 @@ Register bot commands that users can invoke with `/command`:
       "webhookSecret": "your-secret",
       "userId": "1",
       "botId": "123",
+      "clientId": "your-application-token",
+      "webhookUrl": "https://your-openclaw-domain.com/chan/bitrix24/webhook",
       "registerCommandsOnStartup": true,
       "customCommands": [
         {
@@ -129,6 +135,8 @@ Register bot commands that users can invoke with `/command`:
   }
 }
 ```
+
+**Note:** The `clientId` (application token) and `webhookUrl` are required for command registration. The `webhookUrl` must be publicly accessible for Bitrix24 to send command events.
 
 #### Command Options
 
