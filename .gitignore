@@ -1,6 +1,12 @@
 # Dependencies
 node_modules/
 
+# Build output
+dist/
+
+# OpenClaw internal
+.clawdhub/
+
 # Test files
 coverage/
 *.log
