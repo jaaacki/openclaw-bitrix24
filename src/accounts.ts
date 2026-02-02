@@ -72,6 +72,7 @@ export function resolveBitrix24Account({
       userId: bitrix24Config.userId,
       botId: bitrix24Config.botId,
       clientId: bitrix24Config.clientId,
+      customCommands: bitrix24Config.customCommands,
       config: {
         enabled: bitrix24Config.enabled,
         name: bitrix24Config.name,
@@ -81,6 +82,7 @@ export function resolveBitrix24Account({
         botId: bitrix24Config.botId,
         clientId: bitrix24Config.clientId,
         dmPolicy: bitrix24Config.dmPolicy,
+        customCommands: bitrix24Config.customCommands,
       },
     };
   }
@@ -107,6 +109,7 @@ export function resolveBitrix24Account({
     userId: accountConfig.userId,
     botId: accountConfig.botId,
     clientId: accountConfig.clientId,
+    customCommands: accountConfig.customCommands,
     config: accountConfig,
   };
 }

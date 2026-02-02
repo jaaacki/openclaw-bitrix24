@@ -8,8 +8,9 @@ Bitrix24 channel plugin for OpenClaw - enables two-way messaging between OpenCla
 - ✅ Webhook-based message reception
 - ✅ Markdown to BBCode conversion (bold, italic, links, code blocks, etc.)
 - ✅ Smart URL detection (handles URLs in brackets correctly)
+- ✅ **Bot commands** (register, update, unregister via imbot.command API)
+- ✅ Custom command registration on startup
 - ✅ File upload/download
-- ✅ Bot commands
 - ✅ Group & direct messages
 - ✅ Multi-domain support
 - ✅ Policy controls
@@ -95,6 +96,50 @@ For multiple Bitrix24 domains:
   }
 }
 ```
+
+### Custom Commands
+
+Register bot commands that users can invoke with `/command`:
+
+```json
+{
+  "channels": {
+    "bitrix24": {
+      "enabled": true,
+      "domain": "yourcompany.bitrix24.com",
+      "webhookSecret": "your-secret",
+      "userId": "1",
+      "botId": "123",
+      "registerCommandsOnStartup": true,
+      "customCommands": [
+        {
+          "command": "help",
+          "description": "Show available commands",
+          "descriptionDe": "Verfügbare Befehle anzeigen",
+          "common": false
+        },
+        {
+          "command": "status",
+          "description": "Check system status",
+          "params": "[service]",
+          "common": true
+        }
+      ]
+    }
+  }
+}
+```
+
+#### Command Options
+
+| Option | Type | Required | Description |
+|--------|------|----------|-------------|
+| `command` | string | Yes | Command name (1-32 lowercase letters/numbers) |
+| `description` | string | No | English description (max 100 chars) |
+| `descriptionDe` | string | No | German description (required by Bitrix24 API) |
+| `params` | string | No | Parameter hint (e.g., `[query]`) |
+| `common` | boolean | No | If `true`, works in all chats even where bot isn't present |
+| `hidden` | boolean | No | If `true`, command is hidden from command list |
 
 ## Bitrix24 Setup
 

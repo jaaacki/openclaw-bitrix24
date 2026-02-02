@@ -9,7 +9,7 @@ import {
   type ChannelPlugin,
 } from "openclaw/plugin-sdk";
 
-import { Bitrix24ConfigSchema, type ResolvedBitrix24Account } from "./config.js";
+import { Bitrix24ConfigSchema, type ResolvedBitrix24Account, type Bitrix24Config, buildCommandLang } from "./config.js";
 import { getBitrix24Runtime } from "./runtime.js";
 import {
   resolveBitrix24Account,
@@ -31,7 +31,7 @@ export const bitrix24Plugin: ChannelPlugin<ResolvedBitrix24Account> = {
     reactions: false,
     threads: false,
     media: true,
-    nativeCommands: false,
+    nativeCommands: true, // Supports bot commands via imbot.command API
     blockStreaming: false,
   },
   reload: { configPrefixes: ["channels.bitrix24"] },
@@ -275,11 +275,50 @@ export const bitrix24Plugin: ChannelPlugin<ResolvedBitrix24Account> = {
     startAccount: async (ctx) => {
       const account = ctx.account;
       ctx.log?.info(`[${account.accountId}] starting Bitrix24 provider for domain ${account.domain}`);
-      
+
       // For Bitrix24, we don't have long-polling like Telegram
       // The integration works via webhooks configured in Bitrix24 admin panel
       // This is a passive listener that just confirms the account is ready
-      
+
+      // Register custom commands on startup if configured
+      if (account.customCommands && account.customCommands.length > 0) {
+        const cfg = await getBitrix24Runtime().config.loadConfig();
+        const bitrix24Config = cfg.channels?.bitrix24 as Bitrix24Config | undefined;
+
+        if (bitrix24Config?.registerCommandsOnStartup !== false) {
+          try {
+            const client = new Bitrix24Client({
+              domain: account.domain,
+              webhookSecret: account.webhookSecret,
+              userId: account.userId,
+              botId: account.botId,
+              clientId: account.clientId,
+              log: ctx.log || getBitrix24Runtime().logging,
+            });
+
+            ctx.log?.info(`[${account.accountId}] Registering ${account.customCommands.length} custom commands...`);
+
+            for (const cmd of account.customCommands) {
+              try {
+                const lang = buildCommandLang(cmd);
+                await client.registerCommand({
+                  command: cmd.command,
+                  lang,
+                  common: cmd.common,
+                  hidden: cmd.hidden,
+                });
+                ctx.log?.info(`[${account.accountId}] Registered command /${cmd.command}`);
+              } catch (cmdErr) {
+                // Command might already be registered, log and continue
+                ctx.log?.warn?.(`[${account.accountId}] Failed to register /${cmd.command}: ${String(cmdErr)}`);
+              }
+            }
+          } catch (err) {
+            ctx.log?.error?.(`[${account.accountId}] Failed to register commands: ${String(err)}`);
+          }
+        }
+      }
+
       return new Promise((resolve) => {
         // Just keep the provider "running" without blocking
         ctx.abortSignal.addEventListener("abort", () => {

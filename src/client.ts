@@ -19,6 +19,33 @@ interface SendMessageOptions {
   [key: string]: any;
 }
 
+interface CommandLang {
+  LANGUAGE_ID: string;
+  TITLE: string;
+  PARAMS?: string;
+}
+
+interface RegisterCommandOptions {
+  command: string;
+  lang: CommandLang[];
+  common?: boolean;
+  hidden?: boolean;
+  extranetSupport?: boolean;
+  eventHandler?: string;
+}
+
+interface AnswerCommandOptions {
+  commandId?: number;
+  command?: string;
+  messageId: number;
+  message: string;
+  attach?: any;
+  keyboard?: any;
+  menu?: any;
+  system?: boolean;
+  urlPreview?: boolean;
+}
+
 interface ApiResponse {
   result?: any;
   error?: string;
@@ -257,6 +284,180 @@ export class Bitrix24Client {
       this.log.error(`Health check failed: ${(error as Error).message}`);
       return false;
     }
+  }
+
+  // ============================================================================
+  // BOT COMMANDS API
+  // ============================================================================
+
+  /**
+   * Register a bot command
+   * Commands must have LANG translations for at least DE and EN
+   */
+  async registerCommand({
+    command,
+    lang,
+    common = false,
+    hidden = false,
+    extranetSupport = false,
+    eventHandler,
+  }: RegisterCommandOptions): Promise<number> {
+    // Build LANG array for API
+    const langParams: Record<string, string> = {};
+    lang.forEach((l, i) => {
+      langParams[`LANG[${i}][LANGUAGE_ID]`] = l.LANGUAGE_ID;
+      langParams[`LANG[${i}][TITLE]`] = l.TITLE;
+      if (l.PARAMS) {
+        langParams[`LANG[${i}][PARAMS]`] = l.PARAMS;
+      }
+    });
+
+    const params: Record<string, any> = {
+      BOT_ID: this.botId,
+      COMMAND: command,
+      COMMON: common ? "Y" : "N",
+      HIDDEN: hidden ? "Y" : "N",
+      EXTRANET_SUPPORT: extranetSupport ? "Y" : "N",
+      ...langParams,
+    };
+
+    if (eventHandler) {
+      params.EVENT_COMMAND_ADD = eventHandler;
+    }
+
+    if (this.clientId) {
+      params.CLIENT_ID = this.clientId;
+    }
+
+    const result = await this.callApi("imbot.command.register", params);
+    this.log.info?.(`[Bitrix24] Registered command /${command} with ID ${result}`);
+    return result;
+  }
+
+  /**
+   * Unregister a bot command
+   */
+  async unregisterCommand(commandId: number): Promise<boolean> {
+    const params: Record<string, any> = {
+      COMMAND_ID: commandId,
+    };
+
+    if (this.clientId) {
+      params.CLIENT_ID = this.clientId;
+    }
+
+    const result = await this.callApi("imbot.command.unregister", params);
+    this.log.info?.(`[Bitrix24] Unregistered command ID ${commandId}`);
+    return result === true;
+  }
+
+  /**
+   * Update a bot command
+   */
+  async updateCommand(
+    commandId: number,
+    fields: Partial<RegisterCommandOptions>
+  ): Promise<boolean> {
+    const params: Record<string, any> = {
+      COMMAND_ID: commandId,
+    };
+
+    if (fields.hidden !== undefined) {
+      params.HIDDEN = fields.hidden ? "Y" : "N";
+    }
+
+    if (fields.extranetSupport !== undefined) {
+      params.EXTRANET_SUPPORT = fields.extranetSupport ? "Y" : "N";
+    }
+
+    if (fields.eventHandler) {
+      params.EVENT_COMMAND_ADD = fields.eventHandler;
+    }
+
+    if (fields.lang) {
+      fields.lang.forEach((l, i) => {
+        params[`LANG[${i}][LANGUAGE_ID]`] = l.LANGUAGE_ID;
+        params[`LANG[${i}][TITLE]`] = l.TITLE;
+        if (l.PARAMS) {
+          params[`LANG[${i}][PARAMS]`] = l.PARAMS;
+        }
+      });
+    }
+
+    if (this.clientId) {
+      params.CLIENT_ID = this.clientId;
+    }
+
+    const result = await this.callApi("imbot.command.update", params);
+    this.log.info?.(`[Bitrix24] Updated command ID ${commandId}`);
+    return result === true;
+  }
+
+  /**
+   * Answer a bot command
+   * Use this to respond to ONIMCOMMANDADD events
+   */
+  async answerCommand({
+    commandId,
+    command,
+    messageId,
+    message,
+    attach,
+    keyboard,
+    menu,
+    system = false,
+    urlPreview = true,
+  }: AnswerCommandOptions): Promise<number> {
+    // Convert Markdown to BBCode
+    const formattedMessage = this.markdownToBb(message);
+
+    const params: Record<string, any> = {
+      MESSAGE_ID: messageId,
+      MESSAGE: formattedMessage,
+      SYSTEM: system ? "Y" : "N",
+      URL_PREVIEW: urlPreview ? "Y" : "N",
+    };
+
+    // Either COMMAND_ID or COMMAND is required
+    if (commandId) {
+      params.COMMAND_ID = commandId;
+    } else if (command) {
+      params.COMMAND = command;
+    } else {
+      throw new Error("Either commandId or command is required");
+    }
+
+    if (attach) {
+      params.ATTACH = JSON.stringify(attach);
+    }
+
+    if (keyboard) {
+      params.KEYBOARD = JSON.stringify(keyboard);
+    }
+
+    if (menu) {
+      params.MENU = JSON.stringify(menu);
+    }
+
+    if (this.clientId) {
+      params.CLIENT_ID = this.clientId;
+    }
+
+    const result = await this.callApi("imbot.command.answer", params);
+    this.log.info?.(`[Bitrix24] Answered command, response message ID: ${result}`);
+    return result;
+  }
+
+  /**
+   * List registered bot commands
+   */
+  async listCommands(): Promise<any[]> {
+    const params: Record<string, any> = {
+      BOT_ID: this.botId,
+    };
+
+    const result = await this.callApi("imbot.command.get", params);
+    return result || [];
   }
 
   /**

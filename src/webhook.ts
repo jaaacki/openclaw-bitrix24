@@ -91,6 +91,13 @@ async function parseBody(req: IncomingMessage): Promise<any> {
             if (fieldMatch) {
               result.data.BOT[fieldMatch[1]] = value;
             }
+          } else if (key.startsWith("data[COMMAND]")) {
+            // data[COMMAND][0][COMMAND] format for command events
+            if (!result.data.COMMAND) result.data.COMMAND = {};
+            const fieldMatch = key.match(/data\[COMMAND\]\[\d+\]\[(\w+)\]/);
+            if (fieldMatch) {
+              result.data.COMMAND[fieldMatch[1]] = value;
+            }
           } else if (key.startsWith("auth[")) {
             const fieldMatch = key.match(/auth\[(\w+)\]/);
             if (fieldMatch) {
@@ -362,6 +369,11 @@ async function handleIncomingMessage(
 
 /**
  * Handle incoming command event (ONIMCOMMANDADD)
+ *
+ * Event structure:
+ * - COMMAND: { BOT_ID, BOT_CODE, COMMAND, COMMAND_ID, COMMAND_PARAMS, COMMAND_CONTEXT }
+ * - PARAMS: { DIALOG_ID, CHAT_TYPE, MESSAGE, FROM_USER_ID, TO_USER_ID, MESSAGE_ID }
+ * - USER: { ID, NAME, FIRST_NAME, LAST_NAME }
  */
 async function handleIncomingCommand(
   event: Bitrix24WebhookEvent,
@@ -369,13 +381,33 @@ async function handleIncomingCommand(
   log: any,
 ): Promise<void> {
   const { data } = event;
+  const runtime = getBitrix24Runtime();
 
-  // Extract command details
-  const fromUserId = data.COMMAND_USER_ID ?? data.AUTHOR_ID;
-  const commandText = data.COMMAND ?? "";
+  // Extract from COMMAND, PARAMS, and USER structures
+  const command = data.COMMAND || {};
+  const params = data.PARAMS || {};
+  const user = data.USER || {};
 
-  if (!fromUserId || !commandText?.trim()) {
-    log.debug("[Bitrix24] Command event missing details");
+  // Command details
+  const commandName = command.COMMAND || data.COMMAND;
+  const commandId = command.COMMAND_ID;
+  const commandParams = command.COMMAND_PARAMS || "";
+  const commandContext = command.COMMAND_CONTEXT || "TEXTAREA"; // TEXTAREA or KEYBOARD
+  const botId = command.BOT_ID || data.BOT?.BOT_ID;
+
+  // Message details
+  const fromUserId = params.FROM_USER_ID || user.ID || data.AUTHOR_ID;
+  const messageId = params.MESSAGE_ID || data.MESSAGE_ID;
+  const dialogId = params.DIALOG_ID || fromUserId?.toString();
+  const chatType = params.CHAT_TYPE || "P"; // P=private, C=chat, O=open
+  const isGroup = chatType === "C" || chatType === "O";
+
+  // User details
+  const userName = user.NAME || `${user.FIRST_NAME || ""} ${user.LAST_NAME || ""}`.trim() || `User${fromUserId}`;
+  const timestamp = event.ts ? parseInt(event.ts, 10) * 1000 : Date.now();
+
+  if (!fromUserId || !commandName) {
+    log?.debug?.("[Bitrix24] Command event missing required details");
     return;
   }
 
@@ -383,35 +415,126 @@ async function handleIncomingCommand(
   const { verified, account } = await verifySecret(secret, log);
   if (!verified) return;
 
-  log.debug(`[Bitrix24] Incoming command from user ${fromUserId}: ${commandText}`);
+  log?.info?.(`[Bitrix24] Command /${commandName} from ${userName} (${fromUserId}), params: "${commandParams}"`);
 
-  // Get channel config for processing
-  const accountKey = `bitrix24:${account.accountId || "default"}`;
+  // Build full command text (like "/help query")
+  const fullCommandText = commandParams
+    ? `/${commandName} ${commandParams}`
+    : `/${commandName}`;
 
-  // Create command envelope for OpenClaw
-  const envelope = {
+  // Build addresses for routing
+  const peerId = isGroup ? `chat:${dialogId}` : fromUserId.toString();
+  const fromAddress = `bitrix24:${peerId}`;
+  const toAddress = `slash:${fromUserId}`;
+  const conversationLabel = isGroup ? `chat:${dialogId}` : userName;
+
+  // Get config and resolve agent route
+  const cfg = await runtime.config.loadConfig();
+  const route = runtime.channel.routing.resolveAgentRoute({
+    cfg,
     channel: "bitrix24",
-    channelAccount: account.accountId || "default",
-    fromChannelUser: fromUserId.toString(),
-    fromName: `User${fromUserId}`,
-    timestamp: new Date().toISOString(),
-    text: commandText,
-    raw: event,
-  };
+    accountId: account.accountId || "default",
+    peer: {
+      kind: isGroup ? "group" : "dm",
+      id: peerId,
+    },
+  });
 
-  // Deliver to OpenClaw via channel delivery
+  // Parse command arguments (simple space-separated for now)
+  const commandArgs = commandParams ? { raw: commandParams } : undefined;
+
+  // Build finalized context for the agent (following Telegram pattern)
+  const ctxPayload = runtime.channel.reply.finalizeInboundContext({
+    Body: fullCommandText,
+    RawBody: fullCommandText,
+    CommandBody: fullCommandText,
+    CommandArgs: commandArgs,
+    CommandSource: "native",
+    CommandAuthorized: true, // TODO: check allowFrom
+    From: fromAddress,
+    To: toAddress,
+    SessionKey: `bitrix24:slash:${fromUserId}`,
+    AccountId: route.accountId,
+    ChatType: isGroup ? "group" : "direct",
+    ConversationLabel: conversationLabel,
+    GroupSubject: isGroup ? dialogId : undefined,
+    SenderId: fromUserId.toString(),
+    SenderName: userName,
+    Provider: "bitrix24",
+    Surface: "bitrix24",
+    MessageSid: messageId?.toString() || `cmd:${timestamp}`,
+    Timestamp: timestamp,
+    WasMentioned: true,
+    OriginatingChannel: "bitrix24",
+    OriginatingTo: toAddress,
+  });
+
+  // Create Bitrix24 client for sending replies
+  const { Bitrix24Client } = await import("./client.js");
+  const client = new Bitrix24Client({
+    domain: account.domain,
+    webhookSecret: account.webhookSecret,
+    userId: account.userId,
+    botId: account.botId || botId,
+    clientId: account.clientId,
+    log: log || console,
+  });
+
+  // Dispatch to agent and deliver response
   try {
-    await getBitrix24Runtime().channel.delivery.deliverInboundMessage({
-      envelope,
-      cfg: await getBitrix24Runtime().config.loadConfig(),
-      channelKey: accountKey,
+    const messagesConfig = runtime.channel.reply.resolveEffectiveMessagesConfig(cfg, route.agentId);
+
+    await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+      ctx: ctxPayload,
+      cfg,
+      dispatcherOptions: {
+        responsePrefix: messagesConfig.responsePrefix,
+        deliver: async (payload: any, _info: any) => {
+          const text = payload.text || payload.body || payload.content || "";
+          if (!text?.trim()) {
+            log?.warn?.("[Bitrix24] Empty command response, skipping");
+            return;
+          }
+
+          log?.info?.(`[Bitrix24] Sending command response to ${dialogId}: ${text.slice(0, 100)}...`);
+
+          try {
+            // Use answerCommand if we have messageId and commandId, otherwise sendMessage
+            if (messageId && (commandId || commandName)) {
+              await client.answerCommand({
+                commandId: commandId ? parseInt(commandId, 10) : undefined,
+                command: commandId ? undefined : commandName,
+                messageId: parseInt(messageId, 10),
+                message: text,
+              });
+            } else {
+              await client.sendMessage({
+                userId: dialogId,
+                text,
+              });
+            }
+            log?.info?.(`[Bitrix24] Delivered command response`);
+          } catch (sendErr) {
+            log?.error?.(`[Bitrix24] Failed to send command response: ${String(sendErr)}`);
+            throw sendErr;
+          }
+        },
+      },
     });
 
-    log.info(`[Bitrix24] Delivered command from ${fromUserId} to OpenClaw`);
+    log?.info?.(`[Bitrix24] Processed command /${commandName} from ${userName}`);
   } catch (error) {
-    log.error(
-      `[Bitrix24] Failed to deliver command to OpenClaw: ${String(error)}`
-    );
+    log?.error?.(`[Bitrix24] Failed to process command: ${String(error)}`);
+
+    // Fallback: send error message
+    try {
+      await client.sendMessage({
+        userId: dialogId,
+        text: `Sorry, I encountered an error processing the /${commandName} command.`,
+      });
+    } catch (sendErr) {
+      log?.error?.(`[Bitrix24] Failed to send error message: ${String(sendErr)}`);
+    }
   }
 }
 
