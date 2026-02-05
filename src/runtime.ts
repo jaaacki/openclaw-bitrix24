@@ -1,6 +1,8 @@
 /**
  * Runtime dependency injection for Bitrix24 plugin
  * Allows the plugin to access OpenClaw runtime services
+ *
+ * @module runtime
  */
 
 import type { PluginRuntime } from "openclaw/plugin-sdk";

@@ -1,6 +1,8 @@
 /**
  * Bitrix24 Channel Plugin
  * Implements OpenClaw's ChannelPlugin interface for Bitrix24
+ *
+ * @module channel
  */
 
 import {
@@ -300,7 +302,10 @@ export const bitrix24Plugin: ChannelPlugin<ResolvedBitrix24Account> = {
             // Priority: explicit webhookUrl config > gateway publicUrl > gateway remote url
             let webhookUrl = bitrix24Config?.webhookUrl;
             if (!webhookUrl) {
-              const gatewayUrl = (cfg.gateway as any)?.publicUrl || (cfg.gateway as any)?.remote?.url?.replace("wws://", "https://").replace("ws://", "http://");
+              // Gateway config types not exported by OpenClaw SDK, use type assertion
+              type GatewayConfig = { publicUrl?: string; remote?: { url?: string } };
+              const gateway = cfg.gateway as GatewayConfig | undefined;
+              const gatewayUrl = gateway?.publicUrl || gateway?.remote?.url?.replace("wss://", "https://").replace("ws://", "http://");
               webhookUrl = gatewayUrl
                 ? `${gatewayUrl}/chan/bitrix24/webhook?secret=${account.webhookSecret}`
                 : undefined;

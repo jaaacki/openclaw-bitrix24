@@ -1,19 +1,41 @@
 /**
  * Bitrix24 Webhook Handler
  * Handles incoming webhook events from Bitrix24
+ *
+ * @module webhook
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import fs from "node:fs";
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
 import zlib from "node:zlib";
-import { promisify } from "node:util";
-
-const inflateAsync = promisify(zlib.inflate);
 
 import { getBitrix24Runtime } from "./runtime.js";
 import { resolveBitrix24Account } from "./accounts.js";
 import type { Bitrix24Attachment } from "./types.js";
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/** Timeout for agent dispatch (5 minutes) */
+const DISPATCH_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** Timeout for command dispatch (3 minutes) */
+const COMMAND_TIMEOUT_MS = 3 * 60 * 1000;
+
+/** Bitrix24 disk file IDs start at approximately this value */
+const BITRIX24_FILE_ID_THRESHOLD = 690000;
+
+/** Maximum file size for voice transcription (25MB - OpenAI limit) */
+const MAX_VOICE_FILE_SIZE = 25 * 1024 * 1024;
+
+/** Timeout for external API calls (60 seconds) */
+const EXTERNAL_API_TIMEOUT_MS = 60000;
+
+/** Timeout for audio conversion (30 seconds) */
+const AUDIO_CONVERSION_TIMEOUT_MS = 30000;
 
 /**
  * Bitrix24 webhook event types
@@ -175,9 +197,12 @@ async function handleBitrix24Webhook(
 }
 
 /**
- * Verify webhook secret against account config
+ * Verify webhook secret against account config using timing-safe comparison
+ * @param secret - The secret from the webhook request query string
+ * @param log - Logger instance
+ * @returns Object with verification result and resolved account
  */
-async function verifySecret(secret: string | null, log: any): Promise<{ verified: boolean, account?: any }> {
+async function verifySecret(secret: string | null, log: any): Promise<{ verified: boolean; account?: any }> {
   try {
     // Resolve account configuration
     const cfg = await getBitrix24Runtime().config.loadConfig();
@@ -190,9 +215,24 @@ async function verifySecret(secret: string | null, log: any): Promise<{ verified
       return { verified: false };
     }
 
-    // Strict check: Secret must be present and match
-    if (!secret || secret !== account.webhookSecret) {
-      log?.warn?.(`[Bitrix24] Webhook secret verification failed. Received: ${secret ? "***" : "empty"}`);
+    // Strict check: Secret must be present
+    if (!secret) {
+      log?.warn?.("[Bitrix24] Webhook secret verification failed: no secret provided");
+      return { verified: false, account };
+    }
+
+    // Use timing-safe comparison to prevent timing attacks
+    const expected = Buffer.from(account.webhookSecret, "utf8");
+    const received = Buffer.from(secret, "utf8");
+
+    // Length check first (timingSafeEqual requires same length)
+    if (expected.length !== received.length) {
+      log?.warn?.("[Bitrix24] Webhook secret verification failed: length mismatch");
+      return { verified: false, account };
+    }
+
+    if (!crypto.timingSafeEqual(expected, received)) {
+      log?.warn?.("[Bitrix24] Webhook secret verification failed: secret mismatch");
       return { verified: false, account };
     }
 
@@ -262,7 +302,8 @@ async function handleIncomingMessage(
 
   const filesCount = parseInt(params.FILES, 10) || 0;
   const potentialFileId = params.PARAMS ? parseInt(params.PARAMS, 10) : null;
-  const hasAttachment = filesCount > 0 || (potentialFileId && potentialFileId > 690000); // File IDs are high numbers (>690000)
+  // Bitrix24 file IDs are typically high numbers (above threshold)
+  const hasAttachment = filesCount > 0 || (potentialFileId && potentialFileId > BITRIX24_FILE_ID_THRESHOLD);
   
   if (!messageText?.trim() && !data.ATTACHMENTS?.length && !hasAttachment) {
     log?.debug?.("[Bitrix24] Empty message (no text, no attachments), skipping");
@@ -489,10 +530,7 @@ async function handleIncomingMessage(
   // Reply target (user who sent the message)
   const replyDialogId = fromUserId?.toString() || dialogId || "1";
 
-  // Dispatch to agent and deliver response
-  // Use timeout to prevent indefinite hangs (5 minutes max for agent processing)
-  const DISPATCH_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
-  
+  // Dispatch to agent and deliver response with timeout to prevent indefinite hangs
   try {
     log?.info?.(`[Bitrix24] Starting agent dispatch for message from ${userName} (${fromUserId})`);
     const messagesConfig = runtime.channel.reply.resolveEffectiveMessagesConfig(cfg, route.agentId);
@@ -680,10 +718,7 @@ async function handleIncomingCommand(
     log?.debug?.(`[Bitrix24] Command typing indicator failed (non-critical): ${String(err)}`);
   });
 
-  // Dispatch to agent and deliver response
-  // Use timeout to prevent indefinite hangs (3 minutes max for command processing)
-  const COMMAND_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
-  
+  // Dispatch to agent and deliver response with timeout to prevent indefinite hangs
   try {
     log?.info?.(`[Bitrix24] Starting command dispatch for /${commandName} from ${userName}`);
     const messagesConfig = runtime.channel.reply.resolveEffectiveMessagesConfig(cfg, route.agentId);
@@ -1100,7 +1135,7 @@ async function analyzeImageAttachment(
     // Ensure /tmp exists
     const tmpDir = "/tmp";
     try {
-      await fs.promises.access(tmpDir);
+      await fs.access(tmpDir);
     } catch {
       log?.error?.(`[Bitrix24] /tmp directory not accessible`);
       return `[Image: ${attachment.name} - ${formatFileSize(attachment.size)}]`;
@@ -1108,11 +1143,11 @@ async function analyzeImageAttachment(
     
     // Save to temp file
     const tempPath = `/tmp/bitrix24_img_${attachment.id}_${Date.now()}.jpg`;
-    await fs.promises.writeFile(tempPath, fileBuffer);
+    await fs.writeFile(tempPath, fileBuffer);
     log?.info?.(`[Bitrix24] Saved image to: ${tempPath}`);
     
     // Verify file was written
-    const stats = await fs.promises.stat(tempPath);
+    const stats = await fs.stat(tempPath);
     log?.info?.(`[Bitrix24] Image file size on disk: ${stats.size} bytes`);
     
     // Try to use OpenClaw's image analysis tool
@@ -1128,7 +1163,7 @@ async function analyzeImageAttachment(
         if (result && typeof result === 'object' && 'text' in result) {
           const description = (result as any).text;
           // Clean up temp file asynchronously
-          fs.promises.unlink(tempPath).catch(() => {});
+          fs.unlink(tempPath).catch(() => {});
           return description;
         }
       } else {
@@ -1301,7 +1336,7 @@ async function analyzeImageBuffer(imageBuffer: Buffer, attachment: Bitrix24Attac
   try {
     // Save to temp file
     const tempPath = `/tmp/bitrix24_pdfimg_${attachment.id}_${Date.now()}.jpg`;
-    await fs.promises.writeFile(tempPath, imageBuffer);
+    await fs.writeFile(tempPath, imageBuffer);
     
     log?.info?.(`[Bitrix24] Analyzing extracted PDF image: ${tempPath}`);
     
@@ -1313,7 +1348,7 @@ async function analyzeImageBuffer(imageBuffer: Buffer, attachment: Bitrix24Attac
     );
     
     // Clean up
-    fs.promises.unlink(tempPath).catch(() => {});
+    fs.unlink(tempPath).catch(() => {});
     
     return description || `[Scanned page from PDF]`;
   } catch (err) {
@@ -1432,7 +1467,7 @@ async function getOpenAIKey(log?: any): Promise<string | null> {
     const homedir = process.env.HOME || process.env.USERPROFILE || '/Users/noonoon';
     const authPath = `${homedir}/.openclaw/agents/main/agent/auth-profiles.json`;
     
-    const authData = await fs.promises.readFile(authPath, 'utf-8');
+    const authData = await fs.readFile(authPath, 'utf-8');
     const auth = JSON.parse(authData);
     
     const openaiProfile = auth.profiles?.['openai:default'];
@@ -1543,7 +1578,7 @@ async function convertToWav(inputPath: string, log?: any): Promise<string | null
 
     // Check if output file was created
     try {
-      await fs.promises.access(outputPath);
+      await fs.access(outputPath);
       log?.info?.(`[Bitrix24] Audio converted to WAV successfully`);
       return outputPath;
     } catch {
@@ -1669,7 +1704,7 @@ async function transcribeWithQwen(
   } finally {
     // Clean up converted WAV file
     if (convertedPath) {
-      fs.promises.unlink(convertedPath).catch((err) => {
+      fs.unlink(convertedPath).catch((err) => {
         log?.debug?.(`[Bitrix24] Failed to cleanup converted file ${convertedPath}: ${String(err)}`);
       });
     }
@@ -1758,7 +1793,7 @@ async function transcribeVoiceContent(
 
     // Save to temp file once
     tempPath = `/tmp/bitrix24_voice_${attachment.id}_${Date.now()}.mp3`;
-    await fs.promises.writeFile(tempPath, fileBuffer);
+    await fs.writeFile(tempPath, fileBuffer);
     log?.info?.(`[Bitrix24] Saved voice file: ${tempPath}`);
 
     let result: { success: boolean; text?: string; error?: string } | null = null;
@@ -1816,7 +1851,7 @@ async function transcribeVoiceContent(
   } finally {
     // ALWAYS clean up temp file (CRITICAL: prevents memory leak)
     if (tempPath) {
-      fs.promises.unlink(tempPath).catch((unlinkErr) => {
+      fs.unlink(tempPath).catch((unlinkErr) => {
         log?.debug?.(`[Bitrix24] Failed to cleanup temp file ${tempPath}: ${String(unlinkErr)}`);
       });
     }

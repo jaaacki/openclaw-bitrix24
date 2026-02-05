@@ -1,5 +1,7 @@
 /**
  * Bitrix24 configuration schema and types
+ *
+ * @module config
  */
 
 import { z } from "zod";

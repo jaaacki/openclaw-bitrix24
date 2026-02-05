@@ -1,5 +1,8 @@
 /**
  * Bitrix24 account resolution
+ * Resolves account configuration from OpenClaw config
+ *
+ * @module accounts
  */
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk";

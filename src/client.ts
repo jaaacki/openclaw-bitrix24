@@ -1,8 +1,11 @@
 /**
  * Bitrix24 REST API Client
  * Handles API requests to Bitrix24 with rate limiting and error handling
+ *
+ * @module client
  */
 
+/** Configuration options for the Bitrix24 client */
 interface Bitrix24ClientOptions {
   domain: string;
   webhookSecret?: string;
@@ -283,6 +286,40 @@ export class Bitrix24Client {
     } catch (error) {
       this.log?.error?.(`Health check failed: ${(error as Error).message}`);
       return false;
+    }
+  }
+
+  /**
+   * Download file from Bitrix24 URL
+   * Handles authentication for files that require the webhook credentials
+   *
+   * @param url - File download URL
+   * @returns File content as Buffer, or null if download failed
+   */
+  async downloadFile(url: string): Promise<Buffer | null> {
+    try {
+      this.log?.debug?.(`[Bitrix24] Downloading file from: ${url.slice(0, 80)}...`);
+
+      const response = await fetch(url, {
+        method: "GET",
+        headers: {
+          Accept: "*/*",
+        },
+      });
+
+      if (!response.ok) {
+        this.log?.warn?.(`[Bitrix24] Download failed: ${response.status} ${response.statusText}`);
+        return null;
+      }
+
+      const arrayBuffer = await response.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+
+      this.log?.debug?.(`[Bitrix24] Downloaded ${buffer.length} bytes`);
+      return buffer;
+    } catch (error) {
+      this.log?.error?.(`[Bitrix24] Download error: ${String(error)}`);
+      return null;
     }
   }
 

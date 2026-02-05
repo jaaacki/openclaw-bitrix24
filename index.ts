@@ -1,6 +1,8 @@
 /**
  * Bitrix24 Channel Plugin - Entry Point
  * Registers the plugin with OpenClaw
+ *
+ * @module openclaw-bitrix24
  */
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
@@ -11,7 +13,7 @@ import { setBitrix24Runtime } from "./src/runtime.js";
 import { registerBitrix24Webhook } from "./src/webhook.js";
 
 const plugin = {
-  id: "openclaw-bitrix24",
+  id: "bitrix24",
   name: "Bitrix24",
   description: "Bitrix24 channel plugin - two-way messaging via webhooks",
   configSchema: emptyPluginConfigSchema(),

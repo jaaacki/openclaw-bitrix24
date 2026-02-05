@@ -1,6 +1,8 @@
 /**
  * Bitrix24 Plugin Types
  * Type definitions for attachments, typing indicators, and more
+ *
+ * @module types
  */
 
 /**
