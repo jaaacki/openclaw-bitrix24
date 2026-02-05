@@ -117,7 +117,7 @@ export class Bitrix24Client {
     }
 
     const fullUrl = queryParams.toString() ? `${url}?${queryParams.toString()}` : url;
-    this.log.debug?.(`[Bitrix24] API call: ${method} to ${fullUrl}`);
+    this.log?.debug?.(`[Bitrix24] API call: ${method} to ${fullUrl}`);
 
     try {
       const response = await fetch(fullUrl, {
@@ -138,10 +138,10 @@ export class Bitrix24Client {
         throw new Error(`API error: ${data.error_description || data.error}`);
       }
 
-      this.log.debug(`Bitrix24 API call success: ${method}`);
+      this.log?.debug?.(`Bitrix24 API call success: ${method}`);
       return data.result;
     } catch (error) {
-      this.log.error(`Bitrix24 API call failed: ${method}`, error);
+      this.log?.error?.(`Bitrix24 API call failed: ${method}`, error);
       throw error;
     }
   }
@@ -155,7 +155,7 @@ export class Bitrix24Client {
 
     if (elapsed < this.rateLimit.minWait) {
       const waitTime = this.rateLimit.minWait - elapsed;
-      this.log.debug(`Rate limiting: waiting ${waitTime}ms`);
+      this.log?.debug?.(`Rate limiting: waiting ${waitTime}ms`);
       await new Promise((resolve) => setTimeout(resolve, waitTime));
     }
 
@@ -219,7 +219,7 @@ export class Bitrix24Client {
 
     const result = await this.callApi("imbot.bot.update", params);
 
-    this.log.info(`Bot ${botCode} registered for ${this.domain}`);
+    this.log?.info?.(`Bot ${botCode} registered for ${this.domain}`);
     return result;
   }
 
@@ -281,9 +281,166 @@ export class Bitrix24Client {
       await this.callApi("profile.info", {});
       return true;
     } catch (error) {
-      this.log.error(`Health check failed: ${(error as Error).message}`);
+      this.log?.error?.(`Health check failed: ${(error as Error).message}`);
       return false;
     }
+  }
+
+  // ============================================================================
+  // TYPING INDICATOR
+  // ============================================================================
+
+  /**
+   * Send typing indicator to a user or chat
+   * Uses imbot.chat.sendTyping API
+   * Shows "Chat-bot is typing a message..." in the dialog
+   */
+  async sendTyping({ userId, duration = 60 }: { userId: string; duration?: number }): Promise<any> {
+    // Bitrix24 typing indicator API: imbot.chat.sendTyping
+    // Requires BOT_ID and DIALOG_ID
+    const params: Record<string, any> = {
+      DIALOG_ID: userId, // Target user or chat ID
+    };
+
+    if (this.botId) {
+      params.BOT_ID = this.botId;
+    }
+
+    if (this.clientId) {
+      params.CLIENT_ID = this.clientId;
+    }
+
+    this.log?.info?.(`[Bitrix24] Sending typing indicator to ${userId} (${duration}s)`);
+
+    try {
+      const result = await this.callApi("imbot.chat.sendTyping", params);
+      this.log?.info?.(`[Bitrix24] Typing indicator sent to ${userId}`);
+      return { success: true, result, duration };
+    } catch (error) {
+      this.log?.warn?.(`[Bitrix24] Failed to send typing indicator: ${String(error)}`);
+      // Fallback: return simulated success so the flow continues
+      return { success: false, error: String(error), note: "Typing indicator failed but continuing" };
+    }
+  }
+
+  // ============================================================================
+  // ENHANCED FILE ATTACHMENTS
+  // ============================================================================
+
+  /**
+   * Send file from URL (no upload needed)
+   */
+  async sendFileFromUrl({
+    userId,
+    fileName,
+    fileUrl,
+    caption,
+  }: {
+    userId: string;
+    fileName: string;
+    fileUrl: string;
+    caption?: string;
+  }): Promise<any> {
+    const params: Record<string, any> = {
+      DIALOG_ID: userId,
+      ATTACH: [
+        {
+          NAME: fileName,
+          LINK: fileUrl,
+        },
+      ],
+    };
+
+    if (caption) {
+      params.MESSAGE = this.markdownToBb(caption);
+    }
+
+    if (this.botId) {
+      params.BOT_ID = this.botId;
+    }
+
+    const result = await this.callApi("imbot.message.add", params);
+    this.log?.info?.(`[Bitrix24] File URL sent to ${userId}: ${fileName}`);
+    return result;
+  }
+
+  /**
+   * Send multiple attachments in one message
+   */
+  async sendMultipleFiles({
+    userId,
+    attachments,
+    text,
+  }: {
+    userId: string;
+    attachments: Array<{
+      fileName: string;
+      fileType: string;
+      fileContent: Buffer | string;
+      isUrl?: boolean;
+      url?: string;
+    }>;
+    text?: string;
+  }): Promise<any> {
+    const fileIds: number[] = [];
+
+    // Upload all attachments
+    for (const att of attachments) {
+      if (att.isUrl && att.url) {
+        // URL-based attachments use LINK format
+        continue; // Handle separately below
+      }
+
+      const uploadResult = await this.callApi("disk.storage.uploadfile", {
+        FILE_NAME: att.fileName,
+        FILE_CONTENT: {
+          [att.fileType]: att.fileContent,
+        },
+      });
+
+      if (uploadResult?.ID) {
+        fileIds.push(uploadResult.ID);
+      }
+    }
+
+    // Build ATTACH payload
+    const attachPayload: Record<string, any> = {};
+    if (fileIds.length > 0) {
+      attachPayload.MYFILES = fileIds.length === 1 ? fileIds[0] : fileIds;
+    }
+
+    // Add URL-based attachments
+    const urlAttachments = attachments
+      .filter((att) => att.isUrl && att.url)
+      .map((att) => ({
+        NAME: att.fileName,
+        LINK: att.url,
+      }));
+
+    const params: Record<string, any> = {
+      DIALOG_ID: userId,
+    };
+
+    if (Object.keys(attachPayload).length > 0) {
+      params.ATTACH = attachPayload;
+    }
+
+    if (urlAttachments.length > 0) {
+      params.ATTACH = params.ATTACH || {};
+      params.ATTACH.URLS = urlAttachments;
+    }
+
+    if (text) {
+      params.MESSAGE = this.markdownToBb(text);
+    }
+
+    if (this.botId) {
+      params.BOT_ID = this.botId;
+    }
+
+    const result = await this.callApi("imbot.message.add", params);
+    this.log?.info?.(`[Bitrix24] Multiple files sent to ${userId}: ${attachments.length} attachments`);
+    return result;
   }
 
   // ============================================================================
@@ -332,7 +489,7 @@ export class Bitrix24Client {
     }
 
     const result = await this.callApi("imbot.command.register", params);
-    this.log.info?.(`[Bitrix24] Registered command /${command} with ID ${result}`);
+    this.log?.info?.(`[Bitrix24] Registered command /${command} with ID ${result}`);
     return result;
   }
 
@@ -349,7 +506,7 @@ export class Bitrix24Client {
     }
 
     const result = await this.callApi("imbot.command.unregister", params);
-    this.log.info?.(`[Bitrix24] Unregistered command ID ${commandId}`);
+    this.log?.info?.(`[Bitrix24] Unregistered command ID ${commandId}`);
     return result === true;
   }
 
@@ -366,6 +523,10 @@ export class Bitrix24Client {
 
     if (fields.hidden !== undefined) {
       params.HIDDEN = fields.hidden ? "Y" : "N";
+    }
+
+    if (fields.common !== undefined) {
+      params.COMMON = fields.common ? "Y" : "N";
     }
 
     if (fields.extranetSupport !== undefined) {
@@ -391,8 +552,139 @@ export class Bitrix24Client {
     }
 
     const result = await this.callApi("imbot.command.update", params);
-    this.log.info?.(`[Bitrix24] Updated command ID ${commandId}`);
+    this.log?.info?.(`[Bitrix24] Updated command ID ${commandId}`);
     return result === true;
+  }
+
+  /**
+   * Get details of a specific command
+   * Returns command info including HIDDEN, COMMON status
+   */
+  async getCommandDetails(commandId: number): Promise<any> {
+    try {
+      const commands = await this.listCommands();
+      return commands.find((cmd) => cmd.ID === commandId || cmd.COMMAND_ID === commandId);
+    } catch (error) {
+      this.log.error?.(`[Bitrix24] Failed to get command details for ${commandId}`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Show all hidden commands (bulk update HIDDEN = false)
+   * Makes all bot commands visible in the / command menu
+   * 
+   * @returns Summary of updates performed
+   */
+  async showAllCommands(): Promise<{
+    total: number;
+    updated: number;
+    alreadyVisible: number;
+    commands: Array<{ id: number; command: string; hidden: string; updated: boolean }>;
+  }> {
+    try {
+      const commands = await this.listCommands();
+      
+      if (!commands || commands.length === 0) {
+        this.log.info?.("[Bitrix24] No commands found to update");
+        return {
+          total: 0,
+          updated: 0,
+          alreadyVisible: 0,
+          commands: [],
+        };
+      }
+
+      this.log.info?.(`[Bitrix24] Found ${commands.length} commands. Checking visibility status...`);
+
+      const results: Array<{ id: number; command: string; hidden: string; updated: boolean }> = [];
+      let updated = 0;
+      let alreadyVisible = 0;
+
+      for (const cmd of commands) {
+        // Determine command ID - API may return it as ID or COMMAND_ID
+        const commandId = cmd.ID || cmd.COMMAND_ID;
+        const commandName = cmd.COMMAND || "unknown";
+        
+        // HIDDEN field can be "Y" (hidden), "N" (visible), or undefined
+        const isHidden = cmd.HIDDEN === "Y" || cmd.HIDDEN === true;
+        
+        if (isHidden) {
+          try {
+            await this.updateCommand(commandId, { hidden: false });
+            updated++;
+            results.push({ id: commandId, command: commandName, hidden: "Y", updated: true });
+            this.log.info?.(`[Bitrix24] Made command /${commandName} visible`);
+          } catch (err) {
+            results.push({ id: commandId, command: commandName, hidden: "Y", updated: false });
+            this.log.error?.(`[Bitrix24] Failed to update command /${commandName}: ${err}`);
+          }
+        } else {
+          alreadyVisible++;
+          results.push({ 
+            id: commandId, 
+            command: commandName, 
+            hidden: cmd.HIDDEN || "N", 
+            updated: false 
+          });
+        }
+      }
+
+      this.log.info?.(
+        `[Bitrix24] Command visibility update complete: ${updated} updated, ${alreadyVisible} already visible, ${commands.length} total`
+      );
+
+      return {
+        total: commands.length,
+        updated,
+        alreadyVisible,
+        commands: results,
+      };
+    } catch (error) {
+      this.log.error?.("[Bitrix24] Failed to show all commands", error);
+      throw error;
+    }
+  }
+
+  /**
+   * Bulk update command properties
+   * Apply the same field changes to multiple commands
+   * 
+   * @param commandIds Array of command IDs to update
+   * @param fields Fields to update (hidden, common, extranetSupport, etc.)
+   * @returns Results for each command update
+   */
+  async bulkUpdateCommands(
+    commandIds: number[],
+    fields: Partial<RegisterCommandOptions>
+  ): Promise<{
+    results: Array<{ commandId: number; success: boolean; error?: string }>;
+    successful: number;
+    failed: number;
+  }> {
+    const results: Array<{ commandId: number; success: boolean; error?: string }> = [];
+    let successful = 0;
+    let failed = 0;
+
+    for (const commandId of commandIds) {
+      try {
+        await this.updateCommand(commandId, fields);
+        results.push({ commandId, success: true });
+        successful++;
+        this.log.info?.(`[Bitrix24] Bulk update: command ${commandId} updated`);
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        results.push({ commandId, success: false, error: errorMsg });
+        failed++;
+        this.log.error?.(`[Bitrix24] Bulk update: command ${commandId} failed: ${errorMsg}`);
+      }
+    }
+
+    this.log.info?.(
+      `[Bitrix24] Bulk update complete: ${successful} successful, ${failed} failed`
+    );
+
+    return { results, successful, failed };
   }
 
   /**

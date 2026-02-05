@@ -1,5 +1,5 @@
 {
-  "id": "openclaw-bitrix24",
+  "id": "bitrix24",
   "channels": ["bitrix24"],
   "configSchema": {
     "type": "object",

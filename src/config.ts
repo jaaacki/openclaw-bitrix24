@@ -28,6 +28,9 @@ export const Bitrix24AccountConfigSchema = z.object({
   clientId: z.string().optional(), // application_token for bot API calls
   dmPolicy: z.enum(["open", "pairing", "allowlist"]).optional(),
   customCommands: z.array(Bitrix24CommandSchema).optional(),
+  // ASR Provider configuration
+  asrProvider: z.enum(["auto", "qwen", "openai"]).optional(),
+  qwenAsrUrl: z.string().url().optional(),
 });
 
 export const Bitrix24ConfigSchema = z.object({
@@ -44,6 +47,9 @@ export const Bitrix24ConfigSchema = z.object({
   customCommands: z.array(Bitrix24CommandSchema).optional(),
   registerCommandsOnStartup: z.boolean().optional(), // Auto-register commands
   webhookUrl: z.string().url().optional(), // Public URL for command webhook (e.g., https://openclaw.example.com/chan/bitrix24/webhook)
+  // ASR Provider configuration (global default)
+  asrProvider: z.enum(["auto", "qwen", "openai"]).optional(), // "auto" = Qwen3 if available, else OpenAI
+  qwenAsrUrl: z.string().url().optional(), // Qwen3-ASR endpoint (default: http://192.168.2.198:8100/v1/audio/transcriptions)
 });
 
 export type Bitrix24Config = z.infer<typeof Bitrix24ConfigSchema>;

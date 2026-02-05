@@ -9,6 +9,7 @@ Bitrix24 channel plugin for OpenClaw - enables two-way messaging between OpenCla
 - ✅ Markdown to BBCode conversion (bold, italic, links, code blocks, etc.)
 - ✅ Smart URL detection (handles URLs in brackets correctly)
 - ✅ **Bot commands** (register, update, unregister via imbot.command API)
+- ✅ Bulk command visibility management (showAllCommands, bulkUpdateCommands)
 - ✅ Custom command registration on startup
 - ✅ File upload/download
 - ✅ Group & direct messages
@@ -148,6 +149,78 @@ Register bot commands that users can invoke with `/command`:
 | `params` | string | No | Parameter hint (e.g., `[query]`) |
 | `common` | boolean | No | If `true`, works in all chats even where bot isn't present |
 | `hidden` | boolean | No | If `true`, command is hidden from command list |
+
+## Command Visibility Management
+
+### Making Existing Commands Visible
+
+If you have registered commands that are currently hidden and you want to make them visible in Bitrix24's `/` command menu, you can use the `showAllCommands()` helper method:
+
+```typescript
+import { Bitrix24Client } from 'openclaw-bitrix24/src/client';
+
+async function makeCommandsVisible() {
+  const client = new Bitrix24Client({
+    domain: 'yourcompany.bitrix24.com',
+    webhookSecret: 'your-webhook-secret',
+    userId: '1',
+    botId: '123',
+    log: console,
+  });
+
+  // Make all hidden commands visible
+  const result = await client.showAllCommands();
+  
+  console.log(`Total commands: ${result.total}`);
+  console.log(`Updated: ${result.updated}`);
+  console.log(`Already visible: ${result.alreadyVisible}`);
+  
+  // Result includes detailed info:
+  result.commands.forEach(cmd => {
+    console.log(`/${cmd.command}: ${cmd.updated ? 'UPDATED' : 'no change'}`);
+  });
+}
+```
+
+### Bulk Updating Multiple Commands
+
+Update multiple commands at once with the same properties:
+
+```typescript
+const result = await client.bulkUpdateCommands([1, 2, 3], {
+  hidden: false,        // Make visible
+  common: true,         // Make global (works in all chats)
+  extranetSupport: true // Available to extranet users
+});
+
+console.log(`${result.successful} successful, ${result.failed} failed`);
+```
+
+### Individual Command Updates
+
+Get details about a specific command and update its properties:
+
+```typescript
+// List all commands
+const commands = await client.listCommands();
+// Returns: [{ ID: 1, COMMAND: 'help', HIDDEN: 'Y', COMMON: 'N', ... }]
+
+// Get specific command details
+const cmd = await client.getCommandDetails(1);
+
+// Update a single command
+await client.updateCommand(1, { hidden: false });
+await client.updateCommand(1, { common: true });
+```
+
+### Bitrix24 Command Visibility Fields
+
+| Field | API Value | Description |
+|-------|-----------|-------------|
+| `hidden` (HIDDEN) | `'Y'` | Command hidden from menu |
+| `hidden` (HIDDEN) | `'N'` | Command visible in menu |
+| `common` (COMMON) | `'Y'` | Command works globally (in any chat) |
+| `common` (COMMON) | `'N'` | Command works only in bot's chats |
 
 ## Bitrix24 Setup
 
