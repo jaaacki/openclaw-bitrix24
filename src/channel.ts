@@ -174,6 +174,33 @@ export const bitrix24Plugin: ChannelPlugin<ResolvedBitrix24Account> = {
       const target = typeof to === "string" ? to : String(to);
       const userId = target.includes("/") ? target.split("/")[1] : target;
       
+      // Check for MEDIA: prefix
+      const mediaMatch = text.match(/^MEDIA:\s*(.+)$/m);
+      
+      if (mediaMatch) {
+        const filePath = mediaMatch[1].trim();
+        
+        // Strip MEDIA: line from text and clean up extra newlines
+        const caption = text
+          .replace(/^MEDIA:\s*.+$/m, "")
+          .replace(/\n{2,}/g, "\n")
+          .trim();
+        
+        // Send file from path
+        const result = await client.sendFileFromPath({
+          userId,
+          filePath,
+          caption: caption || undefined,
+        });
+        
+        return {
+          channel: "bitrix24",
+          messageId: result.message_id ? String(result.message_id) : undefined,
+          success: true,
+        };
+      }
+      
+      // Regular text message
       const result = await client.sendMessage({
         userId,
         text,

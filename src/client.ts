@@ -276,6 +276,136 @@ export class Bitrix24Client {
   }
 
   /**
+   * Upload file from filesystem and send as attachment
+   * Uses im.disk.file.commit API for proper bot file uploads
+   */
+  async sendFileFromPath({
+    userId,
+    filePath,
+    caption,
+  }: {
+    userId: string;
+    filePath: string;
+    caption?: string;
+  }): Promise<any> {
+    const fs = await import("fs");
+    const path = await import("path");
+    const FormData = await import("form-data");
+
+    // Read file from filesystem
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`File not found: ${filePath}`);
+    }
+
+    const fileBuffer = fs.readFileSync(filePath);
+    const fileName = path.basename(filePath);
+    const fileExt = path.extname(filePath).toLowerCase();
+
+    // Determine if this is a voice/audio file
+    const isAudio = [".mp3", ".ogg", ".m4a", ".wav", ".opus"].includes(fileExt);
+
+    this.log?.info?.(
+      `[Bitrix24] Uploading file: ${fileName} (${fileBuffer.length} bytes)${isAudio ? " as audio" : ""}`
+    );
+
+    // Step 1: Upload file using im.disk.file.commit
+    // Build URL for file upload
+    let url: string;
+    if (this.userId && this.webhookSecret) {
+      url = `https://${this.domain}/rest/${this.userId}/${this.webhookSecret}/im.disk.file.commit`;
+    } else {
+      url = `${this.baseUrl}/im.disk.file.commit`;
+    }
+
+    // Create form data with file
+    const form = new FormData.default();
+    form.append("file", fileBuffer, {
+      filename: fileName,
+      contentType: this.getMimeType(fileExt),
+    });
+
+    if (this.clientId) {
+      form.append("CLIENT_ID", this.clientId);
+    }
+
+    await this.waitForRateLimit();
+
+    this.log?.debug?.(`[Bitrix24] Uploading to: ${url}`);
+
+    try {
+      // Upload file
+      const uploadResponse = await fetch(url, {
+        method: "POST",
+        body: form as any,
+        headers: form.getHeaders(),
+      });
+
+      if (!uploadResponse.ok) {
+        throw new Error(`Upload failed: ${uploadResponse.status} ${uploadResponse.statusText}`);
+      }
+
+      const uploadData: any = await uploadResponse.json();
+
+      if (uploadData.error) {
+        throw new Error(`Upload error: ${uploadData.error_description || uploadData.error}`);
+      }
+
+      if (!uploadData.result || !uploadData.result.FILE_ID) {
+        this.log?.error?.("[Bitrix24] File upload failed - no FILE_ID returned");
+        throw new Error("File upload failed: no FILE_ID returned");
+      }
+
+      const fileId = uploadData.result.FILE_ID;
+      this.log?.info?.(`[Bitrix24] File uploaded successfully, FILE_ID: ${fileId}`);
+
+      // Step 2: Send message with file attachment
+      const params: Record<string, any> = {
+        DIALOG_ID: userId,
+        FILE_ID: [fileId],
+        SYSTEM: "N",
+      };
+
+      if (caption) {
+        params.MESSAGE = this.markdownToBb(caption);
+      }
+
+      if (this.botId) {
+        params.BOT_ID = this.botId;
+      }
+
+      // Send message with file attachment
+      const result = await this.callApi("imbot.message.add", params);
+      this.log?.info?.(`[Bitrix24] File message sent to ${userId}: ${fileName}`);
+
+      return result;
+    } catch (error) {
+      this.log?.error?.(`[Bitrix24] File upload/send failed: ${error}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Get MIME type for file extension
+   */
+  private getMimeType(ext: string): string {
+    const mimeTypes: Record<string, string> = {
+      ".mp3": "audio/mpeg",
+      ".ogg": "audio/ogg",
+      ".m4a": "audio/mp4",
+      ".wav": "audio/wav",
+      ".opus": "audio/opus",
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".png": "image/png",
+      ".gif": "image/gif",
+      ".pdf": "application/pdf",
+      ".txt": "text/plain",
+    };
+
+    return mimeTypes[ext] || "application/octet-stream";
+  }
+
+  /**
    * Health check - verify connection to Bitrix24
    */
   async health(): Promise<boolean> {
