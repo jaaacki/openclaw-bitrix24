@@ -168,6 +168,13 @@ export const bitrix24Plugin: ChannelPlugin<ResolvedBitrix24Account> = {
     textChunkLimit: 4000,
     
     sendText: async ({ to, text, accountId }) => {
+      console.log("[BITRIX24 DEBUG] sendText called with:", {
+        to,
+        accountId,
+        textPreview: text.substring(0, 150),
+        textLength: text.length,
+      });
+      
       const client = await getClientForAccount(accountId);
       
       // Parse target format
@@ -176,6 +183,7 @@ export const bitrix24Plugin: ChannelPlugin<ResolvedBitrix24Account> = {
       
       // Check for MEDIA: prefix
       const mediaMatch = text.match(/^MEDIA:\s*(.+)$/m);
+      console.log("[BITRIX24 DEBUG] MEDIA match:", mediaMatch);
       
       if (mediaMatch) {
         const filePath = mediaMatch[1].trim();
@@ -220,7 +228,26 @@ export const bitrix24Plugin: ChannelPlugin<ResolvedBitrix24Account> = {
       const target = typeof to === "string" ? to : String(to);
       const userId = target.includes("/") ? target.split("/")[1] : target;
       
-      // For media, send URL in message (Bitrix24 API may need file handling)
+      // Check if mediaUrl is a local file path (not http/https URL)
+      const isLocalFile = mediaUrl && !mediaUrl.match(/^https?:\/\//i);
+      
+      if (isLocalFile) {
+        // Upload local file
+        const filePath = mediaUrl.replace(/^file:\/\//, '');
+        const result = await client.sendFileFromPath({
+          userId,
+          filePath,
+          caption: text || undefined,
+        });
+        
+        return {
+          channel: "bitrix24",
+          messageId: result.message_id ? String(result.message_id) : undefined,
+          success: true,
+        };
+      }
+      
+      // Send as URL in message
       const messageText = mediaUrl ? `${text}\n\n${mediaUrl}` : text;
       
       const result = await client.sendMessage({
