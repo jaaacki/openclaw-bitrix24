@@ -626,12 +626,17 @@ async function handleIncomingMessage(
               }
             }
 
-            // Regular text message
-            log?.info?.(`[Bitrix24] Sending response to ${replyDialogId}: ${rawText.slice(0, 100)}...`);
+            // Regular text message (use cleaned text if media was detected but failed)
+            const finalText = media?.cleanText || rawText;
+            if (!finalText?.trim()) {
+              log?.warn?.(`[Bitrix24] No text to send after media extraction, skipping`);
+              return;
+            }
+            log?.info?.(`[Bitrix24] Sending response to ${replyDialogId}: ${finalText.slice(0, 100)}...`);
             try {
               await fileClient.sendMessage({
                 userId: replyDialogId,
-                text: rawText,
+                text: finalText,
               });
               log?.info?.(`[Bitrix24] Delivered agent response to ${replyDialogId}`);
             } catch (sendErr) {

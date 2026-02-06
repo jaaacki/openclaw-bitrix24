@@ -327,23 +327,29 @@ export class Bitrix24Client {
 
       await this.waitForRateLimit();
 
+      // Bitrix24 REST API accepts file params as [filename, base64] via form-urlencoded
+      const uploadParams = new URLSearchParams();
+      uploadParams.append("id", String(folderId));
+      uploadParams.append("data[NAME]", fileName);
+      uploadParams.append("fileContent[]", fileName);
+      uploadParams.append("fileContent[]", base64Content);
+
       const uploadResponse = await fetch(uploadUrl, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          id: folderId,
-          data: { NAME: fileName },
-          fileContent: [fileName, base64Content],
-        }),
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: uploadParams.toString(),
       });
 
-      if (!uploadResponse.ok) {
+      let uploadData: any;
+      try {
+        uploadData = await uploadResponse.json();
+      } catch {
         throw new Error(`File upload failed: ${uploadResponse.status} ${uploadResponse.statusText}`);
       }
 
-      const uploadData: any = await uploadResponse.json();
-      if (uploadData.error) {
-        throw new Error(`File upload error: ${uploadData.error_description || uploadData.error}`);
+      if (!uploadResponse.ok || uploadData.error) {
+        const errMsg = uploadData?.error_description || uploadData?.error || `${uploadResponse.status}`;
+        throw new Error(`File upload error: ${errMsg}`);
       }
 
       const diskFileId = uploadData.result?.ID;
