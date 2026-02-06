@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-02-06
+
+### Fixed
+- **TTS audio delivery**: Deliver callback now detects `MEDIA:` tokens in agent responses and uploads audio files to Bitrix24 instead of sending raw file paths as text
+- **File upload flow**: Rewrote `sendFileFromPath` to use the correct 3-step Bitrix24 API flow: `im.disk.folder.get` → `disk.folder.uploadfile` (base64) → `im.disk.file.commit`
+- **MEDIA token parsing**: Handle `MEDIA\n:` (newline before colon) variant that the framework sometimes produces
+
+### Added
+- `extractMediaFromPayload()` helper that checks `payload.mediaUrl`/`payload.mediaUrls` first, then falls back to parsing `MEDIA:` tokens from text
+- Media handling in both message and command deliver callbacks
+- `buildApiUrl()` helper in Bitrix24Client for constructing REST API URLs
+- `chatId` parameter in `sendFileFromPath` for proper chat-scoped file uploads
+
 ## [1.1.0] - 2025-02-06
 
 ### Security

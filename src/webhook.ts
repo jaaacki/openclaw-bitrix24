@@ -37,6 +37,54 @@ const EXTERNAL_API_TIMEOUT_MS = 60000;
 /** Timeout for audio conversion (30 seconds) */
 const AUDIO_CONVERSION_TIMEOUT_MS = 30000;
 
+/** Regex to match MEDIA: tokens in text (handles newline between MEDIA and :) */
+const MEDIA_TOKEN_RE = /\bMEDIA\s*:\s*`?([^\n`]+)`?/i;
+
+/** Regex to match [[audio_as_voice]] tag */
+const AUDIO_AS_VOICE_RE = /\[\[audio_as_voice\]\]\s*/g;
+
+/**
+ * Extract media URL from a delivery payload.
+ * Checks payload.mediaUrl/mediaUrls first (framework-parsed),
+ * then falls back to parsing MEDIA: tokens from the text.
+ * Returns { mediaUrl, cleanText } or null if no media found.
+ */
+function extractMediaFromPayload(payload: any): { mediaUrl: string; cleanText: string } | null {
+  const rawText: string = payload.text || payload.body || payload.content || "";
+
+  // 1. Check framework-parsed media fields
+  if (payload.mediaUrl) {
+    const cleanText = rawText
+      .replace(AUDIO_AS_VOICE_RE, "")
+      .replace(MEDIA_TOKEN_RE, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+    return { mediaUrl: payload.mediaUrl, cleanText };
+  }
+  if (Array.isArray(payload.mediaUrls) && payload.mediaUrls.length > 0) {
+    const cleanText = rawText
+      .replace(AUDIO_AS_VOICE_RE, "")
+      .replace(MEDIA_TOKEN_RE, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+    return { mediaUrl: payload.mediaUrls[0], cleanText };
+  }
+
+  // 2. Fallback: parse MEDIA: from text
+  const match = rawText.match(MEDIA_TOKEN_RE);
+  if (match) {
+    const mediaUrl = match[1].trim().replace(/^['"]|['"]$/g, "");
+    const cleanText = rawText
+      .replace(AUDIO_AS_VOICE_RE, "")
+      .replace(MEDIA_TOKEN_RE, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+    return { mediaUrl, cleanText };
+  }
+
+  return null;
+}
+
 /**
  * Bitrix24 webhook event types
  */
@@ -545,20 +593,45 @@ async function handleIncomingMessage(
             log?.info?.(`[Bitrix24] Deliver callback invoked, payload keys: ${Object.keys(payload || {}).join(", ")}`);
             log?.debug?.(`[Bitrix24] Full payload: ${JSON.stringify(payload)}`);
 
-            // Extract text from payload
-            const text = payload.text || payload.body || payload.content || "";
-            if (!text?.trim()) {
+            const rawText = payload.text || payload.body || payload.content || "";
+            if (!rawText?.trim()) {
               log?.warn?.(`[Bitrix24] Empty text in payload, skipping delivery`);
               return;
             }
 
-            log?.info?.(`[Bitrix24] Sending response to ${replyDialogId}: ${text.slice(0, 100)}...`);
+            // Check for media (audio/file) in the payload
+            const media = extractMediaFromPayload(payload);
+            if (media) {
+              log?.info?.(`[Bitrix24] Media detected: ${media.mediaUrl}`);
+              try {
+                const isLocalFile = !media.mediaUrl.match(/^https?:\/\//i);
+                if (isLocalFile) {
+                  const filePath = media.mediaUrl.replace(/^file:\/\//, "");
+                  await fileClient.sendFileFromPath({
+                    userId: replyDialogId,
+                    filePath,
+                    caption: media.cleanText || undefined,
+                    chatId: toChatId,
+                  });
+                } else {
+                  // HTTP URL — send text with link
+                  const msg = media.cleanText ? `${media.cleanText}\n\n${media.mediaUrl}` : media.mediaUrl;
+                  await fileClient.sendMessage({ userId: replyDialogId, text: msg });
+                }
+                log?.info?.(`[Bitrix24] Delivered media to ${replyDialogId}`);
+                return;
+              } catch (mediaErr) {
+                log?.error?.(`[Bitrix24] Failed to send media, falling back to text: ${String(mediaErr)}`);
+                // Fall through to send as text
+              }
+            }
 
-            // Send via Bitrix24
+            // Regular text message
+            log?.info?.(`[Bitrix24] Sending response to ${replyDialogId}: ${rawText.slice(0, 100)}...`);
             try {
               await fileClient.sendMessage({
                 userId: replyDialogId,
-                text,
+                text: rawText,
               });
               log?.info?.(`[Bitrix24] Delivered agent response to ${replyDialogId}`);
             } catch (sendErr) {
@@ -633,6 +706,7 @@ async function handleIncomingCommand(
   const dialogId = params.DIALOG_ID || fromUserId?.toString();
   const chatType = params.CHAT_TYPE || "P"; // P=private, C=chat, O=open
   const isGroup = chatType === "C" || chatType === "O";
+  const cmdChatId = params.CHAT_ID || data.CHAT_ID;
 
   // User details
   const userName = user.NAME || `${user.FIRST_NAME || ""} ${user.LAST_NAME || ""}`.trim() || `User${fromUserId}`;
@@ -730,16 +804,38 @@ async function handleIncomingCommand(
         dispatcherOptions: {
           responsePrefix: messagesConfig.responsePrefix,
           deliver: async (payload: any, _info: any) => {
-            const text = payload.text || payload.body || payload.content || "";
-            if (!text?.trim()) {
+            const rawText = payload.text || payload.body || payload.content || "";
+            if (!rawText?.trim()) {
               log?.warn?.("[Bitrix24] Empty command response, skipping");
               return;
             }
 
+            // Check for media in command response
+            const media = extractMediaFromPayload(payload);
+            if (media) {
+              log?.info?.(`[Bitrix24] Command media detected: ${media.mediaUrl}`);
+              try {
+                const isLocalFile = !media.mediaUrl.match(/^https?:\/\//i);
+                if (isLocalFile) {
+                  const filePath = media.mediaUrl.replace(/^file:\/\//, "");
+                  await client.sendFileFromPath({
+                    userId: dialogId,
+                    filePath,
+                    caption: media.cleanText || undefined,
+                    chatId: cmdChatId,
+                  });
+                  log?.info?.(`[Bitrix24] Delivered command media`);
+                  return;
+                }
+              } catch (mediaErr) {
+                log?.error?.(`[Bitrix24] Failed to send command media, falling back to text: ${String(mediaErr)}`);
+              }
+            }
+
+            const text = media?.cleanText || rawText;
             log?.info?.(`[Bitrix24] Sending command response to ${dialogId}: ${text.slice(0, 100)}...`);
 
             try {
-              // Use answerCommand if we have messageId and commandId, otherwise sendMessage
               if (messageId && (commandId || commandName)) {
                 await client.answerCommand({
                   commandId: commandId ? parseInt(commandId, 10) : undefined,

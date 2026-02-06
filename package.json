@@ -1,6 +1,6 @@
 {
-  "name": "openclaw-bitrix24",
-  "version": "1.1.0",
+  "name": "bitrix24",
+  "version": "1.2.0",
   "description": "Bitrix24 connector plugin for OpenClaw - enables two-way messaging between OpenClaw and Bitrix24 chat",
   "type": "module",
   "main": "index.ts",

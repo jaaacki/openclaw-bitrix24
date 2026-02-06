@@ -283,16 +283,16 @@ export class Bitrix24Client {
     userId,
     filePath,
     caption,
+    chatId,
   }: {
     userId: string;
     filePath: string;
     caption?: string;
+    chatId?: string | number;
   }): Promise<any> {
     const fs = await import("fs");
     const path = await import("path");
-    const FormData = await import("form-data");
 
-    // Read file from filesystem
     if (!fs.existsSync(filePath)) {
       throw new Error(`File not found: ${filePath}`);
     }
@@ -300,88 +300,84 @@ export class Bitrix24Client {
     const fileBuffer = fs.readFileSync(filePath);
     const fileName = path.basename(filePath);
     const fileExt = path.extname(filePath).toLowerCase();
-
-    // Determine if this is a voice/audio file
     const isAudio = [".mp3", ".ogg", ".m4a", ".wav", ".opus"].includes(fileExt);
 
     this.log?.info?.(
       `[Bitrix24] Uploading file: ${fileName} (${fileBuffer.length} bytes)${isAudio ? " as audio" : ""}`
     );
 
-    // Step 1: Upload file using im.disk.file.commit
-    // Build URL for file upload
-    let url: string;
-    if (this.userId && this.webhookSecret) {
-      url = `https://${this.domain}/rest/${this.userId}/${this.webhookSecret}/im.disk.file.commit`;
-    } else {
-      url = `${this.baseUrl}/im.disk.file.commit`;
+    if (!chatId) {
+      throw new Error("chatId is required for file upload");
     }
-
-    // Create form data with file
-    const form = new FormData.default();
-    form.append("file", fileBuffer, {
-      filename: fileName,
-      contentType: this.getMimeType(fileExt),
-    });
-
-    if (this.clientId) {
-      form.append("CLIENT_ID", this.clientId);
-    }
-
-    await this.waitForRateLimit();
-
-    this.log?.debug?.(`[Bitrix24] Uploading to: ${url}`);
 
     try {
-      // Upload file
-      const uploadResponse = await fetch(url, {
+      // Step 1: Get the chat's file folder
+      const folderResult = await this.callApi("im.disk.folder.get", {
+        CHAT_ID: String(chatId),
+      });
+      const folderId = folderResult?.ID;
+      if (!folderId) {
+        throw new Error(`Could not get chat folder ID for chat ${chatId}`);
+      }
+      this.log?.info?.(`[Bitrix24] Got chat folder ID: ${folderId}`);
+
+      // Step 2: Upload file to the chat folder via disk.folder.uploadfile
+      const base64Content = fileBuffer.toString("base64");
+      const uploadUrl = this.buildApiUrl("disk.folder.uploadfile");
+
+      await this.waitForRateLimit();
+
+      const uploadResponse = await fetch(uploadUrl, {
         method: "POST",
-        body: form as any,
-        headers: form.getHeaders(),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: folderId,
+          data: { NAME: fileName },
+          fileContent: [fileName, base64Content],
+        }),
       });
 
       if (!uploadResponse.ok) {
-        throw new Error(`Upload failed: ${uploadResponse.status} ${uploadResponse.statusText}`);
+        throw new Error(`File upload failed: ${uploadResponse.status} ${uploadResponse.statusText}`);
       }
 
       const uploadData: any = await uploadResponse.json();
-
       if (uploadData.error) {
-        throw new Error(`Upload error: ${uploadData.error_description || uploadData.error}`);
+        throw new Error(`File upload error: ${uploadData.error_description || uploadData.error}`);
       }
 
-      if (!uploadData.result || !uploadData.result.FILE_ID) {
-        this.log?.error?.("[Bitrix24] File upload failed - no FILE_ID returned");
-        throw new Error("File upload failed: no FILE_ID returned");
+      const diskFileId = uploadData.result?.ID;
+      if (!diskFileId) {
+        throw new Error("File upload returned no ID");
       }
+      this.log?.info?.(`[Bitrix24] File uploaded to disk, ID: ${diskFileId}`);
 
-      const fileId = uploadData.result.FILE_ID;
-      this.log?.info?.(`[Bitrix24] File uploaded successfully, FILE_ID: ${fileId}`);
-
-      // Step 2: Send message with file attachment
-      const params: Record<string, any> = {
-        DIALOG_ID: userId,
-        FILE_ID: [fileId],
-        SYSTEM: "N",
+      // Step 3: Commit (publish) the file into the chat
+      const commitParams: Record<string, any> = {
+        CHAT_ID: String(chatId),
+        DISK_ID: String(diskFileId),
       };
-
       if (caption) {
-        params.MESSAGE = this.markdownToBb(caption);
+        commitParams.MESSAGE = this.markdownToBb(caption);
       }
 
-      if (this.botId) {
-        params.BOT_ID = this.botId;
-      }
-
-      // Send message with file attachment
-      const result = await this.callApi("imbot.message.add", params);
-      this.log?.info?.(`[Bitrix24] File message sent to ${userId}: ${fileName}`);
-
+      const result = await this.callApi("im.disk.file.commit", commitParams);
+      this.log?.info?.(`[Bitrix24] File committed to chat ${chatId}: ${fileName}`);
       return result;
     } catch (error) {
       this.log?.error?.(`[Bitrix24] File upload/send failed: ${error}`);
       throw error;
     }
+  }
+
+  /**
+   * Build the full REST API URL for a given method
+   */
+  private buildApiUrl(method: string): string {
+    if (this.userId && this.webhookSecret) {
+      return `https://${this.domain}/rest/${this.userId}/${this.webhookSecret}/${method}`;
+    }
+    return `${this.baseUrl}/${method}`;
   }
 
   /**
