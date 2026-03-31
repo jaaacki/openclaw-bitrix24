@@ -55,6 +55,11 @@ interface ApiResponse {
   error_description?: string;
 }
 
+/** Maximum number of in-flight + queued rate-limit slots per domain before rejecting with backpressure. */
+const RATE_QUEUE_MAX_DEPTH = 20;
+
+const _domainQueues = new Map<string, { tail: Promise<void>; minWait: number; depth: number }>();
+
 export class Bitrix24Client {
   private domain: string;
   private webhookSecret?: string;
@@ -64,11 +69,7 @@ export class Bitrix24Client {
   private clientId?: string;
   private log: any;
   private baseUrl: string;
-  private rateLimit: {
-    requestsPerSecond: number;
-    lastRequestTime: number;
-    minWait: number;
-  };
+  private rateQueue: { tail: Promise<void>; minWait: number; depth: number };
 
   constructor({ domain, webhookSecret, userId, botId, botCode, clientId, log }: Bitrix24ClientOptions) {
     this.domain = domain;
@@ -79,12 +80,11 @@ export class Bitrix24Client {
     this.clientId = clientId;
     this.log = log;
 
-    // Rate limiting
-    this.rateLimit = {
-      requestsPerSecond: 1,
-      lastRequestTime: 0,
-      minWait: 1000, // 1 second
-    };
+    // Rate limiting — shared queue across all instances for the same domain
+    if (!_domainQueues.has(domain)) {
+      _domainQueues.set(domain, { tail: Promise.resolve(), minWait: 1000, depth: 0 });
+    }
+    this.rateQueue = _domainQueues.get(domain)!;
 
     // Base API URL - always use REST endpoint, auth will be in params
     this.baseUrl = `https://${domain}/rest`;
@@ -102,7 +102,7 @@ export class Bitrix24Client {
     // Add all params as query string (Bitrix24 expects URL params, not JSON body)
     for (const [key, value] of Object.entries(params)) {
       if (value !== undefined && value !== null) {
-        queryParams.append(key, String(value));
+        queryParams.append(key, typeof value === "object" ? JSON.stringify(value) : String(value));
       }
     }
 
@@ -120,7 +120,8 @@ export class Bitrix24Client {
     }
 
     const fullUrl = queryParams.toString() ? `${url}?${queryParams.toString()}` : url;
-    this.log?.debug?.(`[Bitrix24] API call: ${method} to ${fullUrl}`);
+    const logUrl = fullUrl.replace(/\/rest\/(\d+)\/[^/]+\//, "/rest/$1/***/");
+    this.log?.debug?.(`[Bitrix24] API call: ${method} to ${logUrl}`);
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 30_000); // 30s hard limit
@@ -136,6 +137,14 @@ export class Bitrix24Client {
 
       if (!response.ok) {
         throw new Error(`API error ${response.status}: ${response.statusText}`);
+      }
+
+      const contentType = response.headers.get("content-type") ?? "";
+      if (!contentType.includes("application/json") && !contentType.includes("text/javascript")) {
+        const bodyPreview = await response.text().catch(() => "<unreadable>");
+        throw new Error(
+          `API error: expected JSON but got '${contentType}' (status ${response.status}). Body: ${bodyPreview.slice(0, 200)}`
+        );
       }
 
       const data: ApiResponse = await response.json();
@@ -155,19 +164,34 @@ export class Bitrix24Client {
   }
 
   /**
-   * Rate limiting - wait between requests
+   * Rate limiting - serialize requests via a per-domain promise chain.
+   * Each caller waits for the previous caller to finish, then holds the slot
+   * for minWait ms before releasing it. This guarantees exactly minWait between
+   * requests regardless of burst size, with no timeout amplification.
+   *
+   * Rejects immediately with a backpressure error when the queue depth exceeds
+   * RATE_QUEUE_MAX_DEPTH to prevent unbounded memory growth and indefinite starvation.
    */
   private async waitForRateLimit(): Promise<void> {
-    const now = Date.now();
-    const elapsed = now - this.rateLimit.lastRequestTime;
-
-    if (elapsed < this.rateLimit.minWait) {
-      const waitTime = this.rateLimit.minWait - elapsed;
-      this.log?.debug?.(`Rate limiting: waiting ${waitTime}ms`);
-      await new Promise((resolve) => setTimeout(resolve, waitTime));
+    const queue = this.rateQueue;
+    if (queue.depth >= RATE_QUEUE_MAX_DEPTH) {
+      throw new Error(
+        `[Bitrix24] Rate limit queue depth (${queue.depth}) exceeds cap of ${RATE_QUEUE_MAX_DEPTH} for domain ${this.domain} — request rejected (backpressure)`
+      );
     }
-
-    this.rateLimit.lastRequestTime = Date.now();
+    queue.depth++;
+    let release!: () => void;
+    const slot = new Promise<void>((resolve) => { release = resolve; });
+    const prev = queue.tail;
+    queue.tail = slot;
+    try {
+      await prev;
+      this.log?.debug?.(`[Bitrix24] Rate limit slot acquired, waiting ${queue.minWait}ms`);
+      await new Promise<void>((resolve) => setTimeout(resolve, queue.minWait));
+    } finally {
+      queue.depth--;
+      release();
+    }
   }
 
   /**
@@ -235,8 +259,12 @@ export class Bitrix24Client {
    * Get user info by ID
    */
   async getUserInfo(userId: string): Promise<any> {
+    const id = parseInt(userId, 10);
+    if (isNaN(id)) {
+      throw new Error(`getUserInfo: invalid userId "${userId}"`);
+    }
     const result = await this.callApi("user.get", {
-      ID: parseInt(userId, 10),
+      ID: id,
     });
 
     return result && result[0] ? result[0] : null;
@@ -339,11 +367,19 @@ export class Bitrix24Client {
       uploadParams.append("fileContent[]", fileName);
       uploadParams.append("fileContent[]", base64Content);
 
-      const uploadResponse = await fetch(uploadUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: uploadParams.toString(),
-      });
+      const uploadController = new AbortController();
+      const uploadTimer = setTimeout(() => uploadController.abort(), 30_000);
+      let uploadResponse: Response;
+      try {
+        uploadResponse = await fetch(uploadUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: uploadParams.toString(),
+          signal: uploadController.signal,
+        });
+      } finally {
+        clearTimeout(uploadTimer);
+      }
 
       let uploadData: any;
       try {
@@ -434,24 +470,59 @@ export class Bitrix24Client {
    * @returns File content as Buffer, or null if download failed
    */
   async downloadFile(url: string): Promise<Buffer | null> {
+    const MAX_BYTES = 50 * 1024 * 1024; // 50 MB
     try {
       this.log?.debug?.(`[Bitrix24] Downloading file from: ${url.slice(0, 80)}...`);
 
-      const response = await fetch(url, {
-        method: "GET",
-        headers: {
-          Accept: "*/*",
-        },
-      });
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 30_000);
+      let response: Response;
+      try {
+        response = await fetch(url, {
+          method: "GET",
+          headers: { Accept: "*/*" },
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
 
       if (!response.ok) {
         this.log?.warn?.(`[Bitrix24] Download failed: ${response.status} ${response.statusText}`);
         return null;
       }
 
-      const arrayBuffer = await response.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
+      const contentLength = Number(response.headers.get("content-length") ?? 0);
+      if (contentLength > MAX_BYTES) {
+        await response.body?.cancel();
+        this.log?.warn?.(`[Bitrix24] Rejected download: Content-Length ${contentLength} exceeds ${MAX_BYTES} byte cap`);
+        return null;
+      }
 
+      if (!response.body) {
+        this.log?.warn?.("[Bitrix24] Download failed: response body is null");
+        return null;
+      }
+      const chunks: Uint8Array[] = [];
+      let totalBytes = 0;
+      const reader = response.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          totalBytes += value.byteLength;
+          if (totalBytes > MAX_BYTES) {
+            await reader.cancel();
+            this.log?.warn?.(`[Bitrix24] Download aborted mid-stream: exceeded ${MAX_BYTES} byte cap`);
+            return null;
+          }
+          chunks.push(value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+
+      const buffer = Buffer.concat(chunks.map((c) => Buffer.from(c)));
       this.log?.debug?.(`[Bitrix24] Downloaded ${buffer.length} bytes`);
       return buffer;
     } catch (error) {

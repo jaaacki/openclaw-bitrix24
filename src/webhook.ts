@@ -130,28 +130,31 @@ export function registerBitrix24Webhook(api: OpenClawPluginApi): void {
  */
 async function parseBody(req: IncomingMessage): Promise<any> {
   return new Promise((resolve, reject) => {
-    let body = "";
+    const chunks: Buffer[] = [];
     const MAX_BODY_BYTES = 512 * 1024; // 512 KB
     let bytesRead = 0;
-    req.on("data", (chunk) => {
+    req.on("data", (chunk: Buffer) => {
       bytesRead += chunk.length;
       if (bytesRead > MAX_BODY_BYTES) {
-        reject(new Error("Request body exceeds maximum allowed size"));
-        req.destroy();
+        const err = new Error("Request body exceeds maximum allowed size");
+        (err as any).statusCode = 413;
+        reject(err);
         return;
       }
-      body += chunk;
+      chunks.push(chunk);
     });
     req.on("end", () => {
+      const body = Buffer.concat(chunks).toString("utf8");
       try {
         if (!body) {
           resolve({});
           return;
         }
 
-        // Try JSON first
-        if (body.startsWith("{")) {
-          resolve(JSON.parse(body));
+        // Try JSON first (handle objects, arrays, and whitespace-prefixed payloads)
+        const trimmed = body.trim();
+        if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+          resolve(JSON.parse(trimmed));
           return;
         }
 
@@ -218,7 +221,18 @@ async function handleBitrix24Webhook(
     const secret = url.searchParams.get("secret");
 
     // Parse request body
-    const event: Bitrix24WebhookEvent = await parseBody(req);
+    let event: Bitrix24WebhookEvent;
+    try {
+      event = await parseBody(req);
+    } catch (parseErr) {
+      if ((parseErr as any)?.statusCode === 413) {
+        log?.warn?.("[Bitrix24] Rejected oversized webhook body (413)");
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Payload too large" }));
+        return;
+      }
+      throw parseErr;
+    }
     log?.info?.(`[Bitrix24] Received webhook event: ${event.event}`);
     log?.info?.(`[Bitrix24] Raw parsed body: ${JSON.stringify(event)}`);
 
@@ -230,27 +244,38 @@ async function handleBitrix24Webhook(
       return;
     }
 
-    // Handle different event types
+    // ACK immediately — Bitrix24 retries if the response takes too long (~5 s).
+    // All real processing happens asynchronously after this point.
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ success: true }));
+
+    // Handle different event types (fire-and-forget — errors are logged internally)
     switch (event.event) {
       case "ONIMMESSAGEADD":
       case "ONIMBOTMESSAGEADD":
-        await handleIncomingMessage(event, secret, log);
+        handleIncomingMessage(event, secret, log).catch((err) => {
+          log?.error?.(`[Bitrix24] Unhandled error in handleIncomingMessage: ${String(err)}`);
+        });
         break;
 
       case "ONIMCOMMANDADD":
-        await handleIncomingCommand(event, secret, log);
+        handleIncomingCommand(event, secret, log).catch((err) => {
+          log?.error?.(`[Bitrix24] Unhandled error in handleIncomingCommand: ${String(err)}`);
+        });
         break;
 
       default:
         log?.info?.(`[Bitrix24] Unhandled event type: ${event.event}`);
     }
-
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ success: true }));
   } catch (error) {
-    log?.error?.(`[Bitrix24] Webhook processing error: ${String(error)}`);
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Internal error" }));
+    const statusCode = (error as any)?.statusCode === 413 ? 413 : 500;
+    if (statusCode === 413) {
+      log?.warn?.("[Bitrix24] Rejected oversized webhook body");
+    } else {
+      log?.error?.(`[Bitrix24] Webhook processing error: ${String(error)}`);
+    }
+    res.writeHead(statusCode, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: statusCode === 413 ? "Payload too large" : "Internal error" }));
   }
 }
 
@@ -279,18 +304,14 @@ async function verifySecret(secret: string | null, log: any): Promise<{ verified
       return { verified: false, account };
     }
 
-    // Use timing-safe comparison to prevent timing attacks
-    const expected = Buffer.from(account.webhookSecret, "utf8");
-    const received = Buffer.from(secret, "utf8");
-
-    // Length check first (timingSafeEqual requires same length)
-    if (expected.length !== received.length) {
-      log?.warn?.("[Bitrix24] Webhook secret verification failed: length mismatch");
-      return { verified: false, account };
-    }
+    // Use timing-safe comparison on HMAC digests to prevent timing attacks,
+    // including secret-length leakage from differing buffer sizes.
+    const key = crypto.randomBytes(32);
+    const expected = crypto.createHmac("sha256", key).update(account.webhookSecret).digest();
+    const received = crypto.createHmac("sha256", key).update(secret).digest();
 
     if (!crypto.timingSafeEqual(expected, received)) {
-      log?.warn?.("[Bitrix24] Webhook secret verification failed: secret mismatch");
+      log?.warn?.("[Bitrix24] Webhook secret verification failed");
       return { verified: false, account };
     }
 
@@ -593,6 +614,10 @@ async function handleIncomingMessage(
     log?.info?.(`[Bitrix24] Starting agent dispatch for message from ${userName} (${fromUserId})`);
     const messagesConfig = runtime.channel.reply.resolveEffectiveMessagesConfig(cfg, route.agentId);
 
+    // Guard against duplicate delivery after a timeout: once the timeout fires and the
+    // apology is sent, any belated deliver() call from the still-running dispatch is dropped.
+    let delivered = false;
+
     await withTimeout(
       runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
         ctx: ctxPayload,
@@ -600,6 +625,10 @@ async function handleIncomingMessage(
         dispatcherOptions: {
           responsePrefix: messagesConfig.responsePrefix,
           deliver: async (payload: any, _info: any) => {
+            if (delivered) {
+              log?.warn?.(`[Bitrix24] Dropping belated deliver() — already timed out`);
+              return;
+            }
             log?.info?.(`[Bitrix24] Deliver callback invoked, payload keys: ${Object.keys(payload || {}).join(", ")}`);
             log?.debug?.(`[Bitrix24] Full payload: ${JSON.stringify(payload)}`);
 
@@ -667,10 +696,12 @@ async function handleIncomingMessage(
     log?.error?.(`[Bitrix24] Failed to process message: ${errorMsg}`);
 
     // Fallback: send error message with context
-    const userMessage = isTimeout 
+    const userMessage = isTimeout
       ? `Sorry, processing your message took too long. Please try again or simplify your request.`
       : `Sorry, I encountered an error processing your message.`;
-    
+
+    // Mark delivery as consumed so any belated deliver() from the orphaned dispatch is dropped.
+    delivered = true;
     try {
       await fileClient.sendMessage({
         userId: replyDialogId,
@@ -700,6 +731,10 @@ async function handleIncomingCommand(
   secret: string | null,
   log: any,
 ): Promise<void> {
+  // AUTH GATE — must be first
+  const { verified, account } = await verifySecret(secret, log);
+  if (!verified) return;
+
   const { data } = event;
   const runtime = getBitrix24Runtime();
 
@@ -731,10 +766,6 @@ async function handleIncomingCommand(
     log?.debug?.("[Bitrix24] Command event missing required details");
     return;
   }
-
-  // Verify secret
-  const { verified, account } = await verifySecret(secret, log);
-  if (!verified) return;
 
   log?.info?.(`[Bitrix24] Command /${commandName} from ${userName} (${fromUserId}), params: "${commandParams}"`);
 
@@ -812,6 +843,9 @@ async function handleIncomingCommand(
     log?.info?.(`[Bitrix24] Starting command dispatch for /${commandName} from ${userName}`);
     const messagesConfig = runtime.channel.reply.resolveEffectiveMessagesConfig(cfg, route.agentId);
 
+    // Guard against duplicate delivery after a timeout (same pattern as message handler).
+    let delivered = false;
+
     await withTimeout(
       runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
         ctx: ctxPayload,
@@ -819,6 +853,10 @@ async function handleIncomingCommand(
         dispatcherOptions: {
           responsePrefix: messagesConfig.responsePrefix,
           deliver: async (payload: any, _info: any) => {
+            if (delivered) {
+              log?.warn?.(`[Bitrix24] Dropping belated command deliver() — already timed out`);
+              return;
+            }
             const rawText = payload.text || payload.body || payload.content || "";
             if (!rawText?.trim()) {
               log?.warn?.("[Bitrix24] Empty command response, skipping");
@@ -886,7 +924,9 @@ async function handleIncomingCommand(
     const userMessage = isTimeout
       ? `Sorry, the /${commandName} command took too long to process. Please try again.`
       : `Sorry, I encountered an error processing the /${commandName} command.`;
-    
+
+    // Mark delivery as consumed so any belated deliver() from the orphaned dispatch is dropped.
+    delivered = true;
     try {
       await client.sendMessage({
         userId: dialogId,
@@ -1213,19 +1253,57 @@ async function downloadAndProcessAttachment(
   }
 }
 
+/** Hard cap for any attachment download — prevents OOM from hostile URLs */
+const MAX_ATTACHMENT_DOWNLOAD_BYTES = 50 * 1024 * 1024; // 50 MB
+
 /**
  * Download file from URL using fetch
  */
 async function downloadFileFromUrl(url: string, log?: any): Promise<Buffer | null> {
   try {
     log?.debug?.(`[Bitrix24] Starting download from: ${url.slice(0, 50)}...`);
-    const response = await fetch(url);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30_000);
+    let response: Response;
+    try {
+      response = await fetch(url, { signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
     if (!response.ok) {
       log?.warn?.(`[Bitrix24] Download failed: ${response.status} ${response.statusText}`);
       return null;
     }
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
+
+    // Reject immediately if Content-Length already exceeds cap
+    const contentLength = Number(response.headers.get("content-length") ?? 0);
+    if (contentLength > MAX_ATTACHMENT_DOWNLOAD_BYTES) {
+      log?.warn?.(`[Bitrix24] Rejecting download: Content-Length ${contentLength} exceeds ${MAX_ATTACHMENT_DOWNLOAD_BYTES} byte cap`);
+      await response.body?.cancel();
+      return null;
+    }
+
+    // Stream with a running byte counter so a missing/lying Content-Length can't DoS us
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+    const reader = response.body!.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        totalBytes += value.byteLength;
+        if (totalBytes > MAX_ATTACHMENT_DOWNLOAD_BYTES) {
+          await reader.cancel();
+          log?.warn?.(`[Bitrix24] Download aborted mid-stream: exceeded ${MAX_ATTACHMENT_DOWNLOAD_BYTES} byte cap`);
+          return null;
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    const buffer = Buffer.concat(chunks.map((c) => Buffer.from(c)));
     log?.debug?.(`[Bitrix24] Downloaded ${buffer.length} bytes`);
     return buffer;
   } catch (err) {
@@ -1256,41 +1334,36 @@ async function analyzeImageAttachment(
     const tempPath = `/tmp/bitrix24_img_${attachment.id}_${Date.now()}.jpg`;
     await fs.writeFile(tempPath, fileBuffer);
     log?.info?.(`[Bitrix24] Saved image to: ${tempPath}`);
-    
-    // Verify file was written
-    const stats = await fs.stat(tempPath);
-    log?.info?.(`[Bitrix24] Image file size on disk: ${stats.size} bytes`);
-    
-    // Try to use OpenClaw's image analysis tool
+
     try {
-      const runtime = getBitrix24Runtime();
-      if (runtime?.tools?.image) {
-        log?.info?.(`[Bitrix24] Calling image analysis tool...`);
-        const result = await runtime.tools.image({
-          image: tempPath,
-          prompt: "Describe what you see in this image in detail."
-        });
-        
-        if (result && typeof result === 'object' && 'text' in result) {
-          const description = (result as any).text;
-          // Clean up temp file asynchronously
-          fs.unlink(tempPath).catch(() => {});
-          return description;
+      // Verify file was written
+      const stats = await fs.stat(tempPath);
+      log?.info?.(`[Bitrix24] Image file size on disk: ${stats.size} bytes`);
+
+      // Try to use OpenClaw's image analysis tool
+      try {
+        const runtime = getBitrix24Runtime();
+        if (runtime?.tools?.image) {
+          log?.info?.(`[Bitrix24] Calling image analysis tool...`);
+          const result = await runtime.tools.image({
+            image: tempPath,
+            prompt: "Describe what you see in this image in detail."
+          });
+
+          if (result && typeof result === 'object' && 'text' in result) {
+            return (result as any).text;
+          }
+        } else {
+          log?.warn?.(`[Bitrix24] Image analysis tool not available on runtime`);
         }
-      } else {
-        log?.warn?.(`[Bitrix24] Image analysis tool not available on runtime`);
+      } catch (toolErr) {
+        log?.warn?.(`[Bitrix24] Image analysis tool error: ${String(toolErr)}`);
       }
-    } catch (toolErr) {
-      log?.warn?.(`[Bitrix24] Image analysis tool error: ${String(toolErr)}`);
+
+      return `[Image: ${attachment.name} - ${formatFileSize(attachment.size)}]`;
+    } finally {
+      fs.unlink(tempPath).catch(() => {});
     }
-    
-    // Fallback: return file info with note that visual analysis wasn't possible
-    const description = `[Image: ${attachment.name} - ${formatFileSize(attachment.size)} saved to ${tempPath}]`;
-    
-    // Keep the file for manual inspection
-    log?.info?.(`[Bitrix24] Image preserved at: ${tempPath}`);
-    
-    return description;
   } catch (err) {
     log?.error?.(`[Bitrix24] Image analysis failed: ${String(err)}`);
     return `[Image: ${attachment.name}]`;
@@ -1575,7 +1648,7 @@ type ASRProvider = "openai" | "qwen" | "auto";
  */
 async function getOpenAIKey(log?: any): Promise<string | null> {
   try {
-    const homedir = process.env.HOME || process.env.USERPROFILE || '/Users/noonoon';
+    const homedir = process.env.HOME || process.env.USERPROFILE || process.env.HOMEPATH || '/tmp';
     const authPath = `${homedir}/.openclaw/agents/main/agent/auth-profiles.json`;
     
     const authData = await fs.readFile(authPath, 'utf-8');
@@ -1674,18 +1747,18 @@ async function determineASRProvider(
  */
 async function convertToWav(inputPath: string, log?: any): Promise<string | null> {
   try {
-    const { exec } = await import("node:child_process");
+    const { execFile } = await import("node:child_process");
     const { promisify } = await import("node:util");
-    const execAsync = promisify(exec);
+    const execFileAsync = promisify(execFile);
 
     const outputPath = inputPath.replace(/\.[^.]+$/, '.wav');
 
-    // Convert to 16kHz mono WAV (optimal for ASR)
-    const ffmpegCmd = `ffmpeg -i "${inputPath}" -ar 16000 -ac 1 -y "${outputPath}" 2>&1`;
-
     log?.debug?.(`[Bitrix24] Converting audio to WAV: ${inputPath} -> ${outputPath}`);
 
-    const { stdout, stderr } = await execAsync(ffmpegCmd, { timeout: 30000 });
+    // Use execFile with an argument array — never interpolate paths into a shell string
+    await execFileAsync("ffmpeg", ["-i", inputPath, "-ar", "16000", "-ac", "1", "-y", outputPath], {
+      timeout: AUDIO_CONVERSION_TIMEOUT_MS,
+    });
 
     // Check if output file was created
     try {
@@ -1715,9 +1788,9 @@ async function transcribeWithQwen(
   let convertedPath: string | null = null;
 
   try {
-    const { exec } = await import("node:child_process");
+    const { execFile } = await import("node:child_process");
     const { promisify } = await import("node:util");
-    const execAsync = promisify(exec);
+    const execFileAsync = promisify(execFile);
 
     // Qwen3-ASR endpoint - uses local model, no API key needed
     const qwenEndpoint = qwenUrl || "http://192.168.2.198:8100/v1/audio/transcriptions";
@@ -1736,16 +1809,17 @@ async function transcribeWithQwen(
       }
     }
 
-    const curlCmd = `curl -s -X POST "${qwenEndpoint}" \
-      -H "Content-Type: multipart/form-data" \
-      -F file="@${fileToSend}" \
-      -F model="Qwen/Qwen3-ASR-0.6B" \
-      -F response_format="json" \
-      --max-time 60 2>&1`;
-
     log?.info?.(`[Bitrix24] Calling Qwen3-ASR at ${qwenEndpoint}...`);
-    
-    const { stdout } = await execAsync(curlCmd, { timeout: 65000 });
+
+    // Use execFile with argument array — never interpolate paths or URLs into a shell string
+    const { stdout } = await execFileAsync("curl", [
+      "-s", "-X", "POST", qwenEndpoint,
+      "-H", "Content-Type: multipart/form-data",
+      "-F", `file=@${fileToSend}`,
+      "-F", "model=Qwen/Qwen3-ASR-0.6B",
+      "-F", "response_format=json",
+      "--max-time", "60",
+    ], { timeout: 65000 });
     
     if (stdout) {
       // Qwen3-ASR returns plain text (e.g., "hello world") not JSON
@@ -1832,20 +1906,21 @@ async function transcribeWithOpenAI(
   log?: any
 ): Promise<{ success: boolean; text?: string; error?: string }> {
   try {
-    const { exec } = await import("node:child_process");
+    const { execFile } = await import("node:child_process");
     const { promisify } = await import("node:util");
-    const execAsync = promisify(exec);
-    
-    const curlCmd = `curl -s https://api.openai.com/v1/audio/transcriptions \
-      -H "Authorization: Bearer ${apiKey}" \
-      -H "Content-Type: multipart/form-data" \
-      -F file="@${tempPath}" \
-      -F model="whisper-1" \
-      -F response_format="json" 2>&1`;
-    
+    const execFileAsync = promisify(execFile);
+
     log?.info?.(`[Bitrix24] Calling OpenAI Whisper API...`);
-    
-    const { stdout } = await execAsync(curlCmd, { timeout: 60000 });
+
+    // Use execFile with argument array — never interpolate paths or credentials into a shell string
+    const { stdout } = await execFileAsync("curl", [
+      "-s", "https://api.openai.com/v1/audio/transcriptions",
+      "-H", `Authorization: Bearer ${apiKey}`,
+      "-H", "Content-Type: multipart/form-data",
+      "-F", `file=@${tempPath}`,
+      "-F", "model=whisper-1",
+      "-F", "response_format=json",
+    ], { timeout: 60000 });
     
     if (stdout) {
       try {
@@ -1902,8 +1977,11 @@ async function transcribeVoiceContent(
     // Determine which ASR provider to use
     const { provider, qwenUrl } = await determineASRProvider(accountConfig, globalConfig, log);
 
-    // Save to temp file once
-    tempPath = `/tmp/bitrix24_voice_${attachment.id}_${Date.now()}.mp3`;
+    // Save to temp file once — extension is used in shell commands so must be whitelisted
+    const SAFE_VOICE_EXTENSIONS = new Set([".mp3", ".ogg", ".m4a", ".wav", ".opus", ".flac", ".aac"]);
+    const rawExt = attachment.name.match(/\.[^.]+$/)?.[0]?.toLowerCase() ?? "";
+    const voiceExt = SAFE_VOICE_EXTENSIONS.has(rawExt) ? rawExt : ".mp3";
+    tempPath = `/tmp/bitrix24_voice_${attachment.id}_${Date.now()}${voiceExt}`;
     await fs.writeFile(tempPath, fileBuffer);
     log?.info?.(`[Bitrix24] Saved voice file: ${tempPath}`);
 
