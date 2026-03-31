@@ -199,6 +199,7 @@ export const bitrix24Plugin: ChannelPlugin<ResolvedBitrix24Account> = {
           userId,
           filePath,
           caption: caption || undefined,
+          chatId: userId,
         });
         
         return {
@@ -238,6 +239,7 @@ export const bitrix24Plugin: ChannelPlugin<ResolvedBitrix24Account> = {
           userId,
           filePath,
           caption: text || undefined,
+          chatId: userId,
         });
         
         return {
@@ -372,7 +374,7 @@ export const bitrix24Plugin: ChannelPlugin<ResolvedBitrix24Account> = {
               ctx.log?.warn?.(`[${account.accountId}] Cannot register commands: no public gateway URL configured`);
             } else {
               ctx.log?.info(`[${account.accountId}] Registering ${account.customCommands.length} custom commands...`);
-              ctx.log?.info(`[${account.accountId}] Webhook URL: ${webhookUrl}`);
+              ctx.log?.info(`[${account.accountId}] Webhook URL: ${webhookUrl.replace(/secret=[^&]+/, "secret=***")}`);
 
               for (const cmd of account.customCommands) {
                 try {
