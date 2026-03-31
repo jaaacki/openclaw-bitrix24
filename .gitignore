@@ -21,9 +21,6 @@ coverage/
 *.swp
 *.swo
 
-# Local worktrees
-.worktrees/
-
 # OS
 .DS_Store
 Thumbs.db
