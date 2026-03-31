@@ -5,6 +5,8 @@
  * @module client
  */
 
+import { createSerializedRateLimiter } from "./reliability.js";
+
 /** Configuration options for the Bitrix24 client */
 interface Bitrix24ClientOptions {
   domain: string;
@@ -55,6 +57,31 @@ interface ApiResponse {
   error_description?: string;
 }
 
+const API_REQUEST_TIMEOUT_MS = 30_000;
+const FILE_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024;
+const RATE_LIMIT_MIN_WAIT_MS = 1000;
+const RATE_QUEUE_MAX_DEPTH = 20;
+
+const domainRateLimiters = new Map<string, () => Promise<void>>();
+
+function getDomainRateLimiter(domain: string): () => Promise<void> {
+  if (!domainRateLimiters.has(domain)) {
+    domainRateLimiters.set(
+      domain,
+      createSerializedRateLimiter({
+        minWait: RATE_LIMIT_MIN_WAIT_MS,
+        maxDepth: RATE_QUEUE_MAX_DEPTH,
+      }),
+    );
+  }
+
+  return domainRateLimiters.get(domain)!;
+}
+
+function maskWebhookUrl(url: string): string {
+  return url.replace(/\/rest\/([^/]+)\/[^/]+\//, "/rest/$1/***/");
+}
+
 export class Bitrix24Client {
   private domain: string;
   private webhookSecret?: string;
@@ -64,11 +91,7 @@ export class Bitrix24Client {
   private clientId?: string;
   private log: any;
   private baseUrl: string;
-  private rateLimit: {
-    requestsPerSecond: number;
-    lastRequestTime: number;
-    minWait: number;
-  };
+  private rateLimiter: () => Promise<void>;
 
   constructor({ domain, webhookSecret, userId, botId, botCode, clientId, log }: Bitrix24ClientOptions) {
     this.domain = domain;
@@ -78,13 +101,7 @@ export class Bitrix24Client {
     this.botCode = botCode;
     this.clientId = clientId;
     this.log = log;
-
-    // Rate limiting
-    this.rateLimit = {
-      requestsPerSecond: 1,
-      lastRequestTime: 0,
-      minWait: 1000, // 1 second
-    };
+    this.rateLimiter = getDomainRateLimiter(domain);
 
     // Base API URL - always use REST endpoint, auth will be in params
     this.baseUrl = `https://${domain}/rest`;
@@ -102,7 +119,7 @@ export class Bitrix24Client {
     // Add all params as query string (Bitrix24 expects URL params, not JSON body)
     for (const [key, value] of Object.entries(params)) {
       if (value !== undefined && value !== null) {
-        queryParams.append(key, String(value));
+        queryParams.append(key, typeof value === "object" ? JSON.stringify(value) : String(value));
       }
     }
 
@@ -120,8 +137,10 @@ export class Bitrix24Client {
     }
 
     const fullUrl = queryParams.toString() ? `${url}?${queryParams.toString()}` : url;
-    this.log?.debug?.(`[Bitrix24] API call: ${method} to ${fullUrl}`);
+    this.log?.debug?.(`[Bitrix24] API call: ${method} to ${maskWebhookUrl(fullUrl)}`);
 
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), API_REQUEST_TIMEOUT_MS);
     try {
       const response = await fetch(fullUrl, {
         method: "POST",
@@ -129,10 +148,19 @@ export class Bitrix24Client {
           "Accept": "*/*",
           "Content-Length": "0",
         },
+        signal: controller.signal,
       });
 
       if (!response.ok) {
         throw new Error(`API error ${response.status}: ${response.statusText}`);
+      }
+
+      const contentType = response.headers.get("content-type") ?? "";
+      if (!contentType.includes("application/json") && !contentType.includes("text/javascript")) {
+        const bodyPreview = await response.text().catch(() => "<unreadable>");
+        throw new Error(
+          `API error: expected JSON but got '${contentType}' (status ${response.status}). Body: ${bodyPreview.slice(0, 200)}`,
+        );
       }
 
       const data: ApiResponse = await response.json();
@@ -146,23 +174,16 @@ export class Bitrix24Client {
     } catch (error) {
       this.log?.error?.(`Bitrix24 API call failed: ${method}`, error);
       throw error;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
   /**
-   * Rate limiting - wait between requests
+   * Rate limiting - serialize requests per domain with bounded queue depth.
    */
   private async waitForRateLimit(): Promise<void> {
-    const now = Date.now();
-    const elapsed = now - this.rateLimit.lastRequestTime;
-
-    if (elapsed < this.rateLimit.minWait) {
-      const waitTime = this.rateLimit.minWait - elapsed;
-      this.log?.debug?.(`Rate limiting: waiting ${waitTime}ms`);
-      await new Promise((resolve) => setTimeout(resolve, waitTime));
-    }
-
-    this.rateLimit.lastRequestTime = Date.now();
+    await this.rateLimiter();
   }
 
   /**
@@ -230,8 +251,13 @@ export class Bitrix24Client {
    * Get user info by ID
    */
   async getUserInfo(userId: string): Promise<any> {
+    const id = parseInt(userId, 10);
+    if (isNaN(id)) {
+      throw new Error(`getUserInfo: invalid userId "${userId}"`);
+    }
+
     const result = await this.callApi("user.get", {
-      ID: parseInt(userId, 10),
+      ID: id,
     });
 
     return result && result[0] ? result[0] : null;
@@ -334,11 +360,19 @@ export class Bitrix24Client {
       uploadParams.append("fileContent[]", fileName);
       uploadParams.append("fileContent[]", base64Content);
 
-      const uploadResponse = await fetch(uploadUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: uploadParams.toString(),
-      });
+      const uploadController = new AbortController();
+      const uploadTimer = setTimeout(() => uploadController.abort(), API_REQUEST_TIMEOUT_MS);
+      let uploadResponse: Response;
+      try {
+        uploadResponse = await fetch(uploadUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: uploadParams.toString(),
+          signal: uploadController.signal,
+        });
+      } finally {
+        clearTimeout(uploadTimer);
+      }
 
       let uploadData: any;
       try {
@@ -432,20 +466,64 @@ export class Bitrix24Client {
     try {
       this.log?.debug?.(`[Bitrix24] Downloading file from: ${url.slice(0, 80)}...`);
 
-      const response = await fetch(url, {
-        method: "GET",
-        headers: {
-          Accept: "*/*",
-        },
-      });
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), API_REQUEST_TIMEOUT_MS);
+      let response: Response;
+      try {
+        response = await fetch(url, {
+          method: "GET",
+          headers: {
+            Accept: "*/*",
+          },
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
 
       if (!response.ok) {
         this.log?.warn?.(`[Bitrix24] Download failed: ${response.status} ${response.statusText}`);
         return null;
       }
 
-      const arrayBuffer = await response.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
+      const contentLength = Number(response.headers.get("content-length") ?? 0);
+      if (contentLength > FILE_DOWNLOAD_MAX_BYTES) {
+        await response.body?.cancel();
+        this.log?.warn?.(
+          `[Bitrix24] Rejected download: Content-Length ${contentLength} exceeds ${FILE_DOWNLOAD_MAX_BYTES} byte cap`,
+        );
+        return null;
+      }
+
+      if (!response.body) {
+        this.log?.warn?.("[Bitrix24] Download failed: response body is null");
+        return null;
+      }
+
+      const chunks: Uint8Array[] = [];
+      let totalBytes = 0;
+      const reader = response.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            break;
+          }
+          totalBytes += value.byteLength;
+          if (totalBytes > FILE_DOWNLOAD_MAX_BYTES) {
+            await reader.cancel();
+            this.log?.warn?.(
+              `[Bitrix24] Download aborted mid-stream: exceeded ${FILE_DOWNLOAD_MAX_BYTES} byte cap`,
+            );
+            return null;
+          }
+          chunks.push(value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+
+      const buffer = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
 
       this.log?.debug?.(`[Bitrix24] Downloaded ${buffer.length} bytes`);
       return buffer;
@@ -572,12 +650,6 @@ export class Bitrix24Client {
       }
     }
 
-    // Build ATTACH payload
-    const attachPayload: Record<string, any> = {};
-    if (fileIds.length > 0) {
-      attachPayload.MYFILES = fileIds.length === 1 ? fileIds[0] : fileIds;
-    }
-
     // Add URL-based attachments
     const urlAttachments = attachments
       .filter((att) => att.isUrl && att.url)
@@ -590,13 +662,14 @@ export class Bitrix24Client {
       DIALOG_ID: userId,
     };
 
-    if (Object.keys(attachPayload).length > 0) {
-      params.ATTACH = attachPayload;
-    }
-
-    if (urlAttachments.length > 0) {
-      params.ATTACH = params.ATTACH || {};
-      params.ATTACH.URLS = urlAttachments;
+    if (fileIds.length > 0 || urlAttachments.length > 0) {
+      params.ATTACH = {};
+      if (fileIds.length > 0) {
+        params.ATTACH.MYFILES = fileIds.length === 1 ? fileIds[0] : fileIds;
+      }
+      if (urlAttachments.length > 0) {
+        params.ATTACH.URLS = urlAttachments;
+      }
     }
 
     if (text) {
