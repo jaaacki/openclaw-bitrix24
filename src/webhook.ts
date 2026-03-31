@@ -11,6 +11,12 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import zlib from "node:zlib";
 
+import {
+  readRequestBody,
+  RequestBodyTimeoutError,
+  RequestBodyTooLargeError,
+} from "./request-body.js";
+import { createSingleDeliveryGate } from "./reliability.js";
 import { getBitrix24Runtime } from "./runtime.js";
 import { resolveBitrix24Account } from "./accounts.js";
 import type { Bitrix24Attachment } from "./types.js";
@@ -25,11 +31,20 @@ const DISPATCH_TIMEOUT_MS = 5 * 60 * 1000;
 /** Timeout for command dispatch (3 minutes) */
 const COMMAND_TIMEOUT_MS = 3 * 60 * 1000;
 
+/** Maximum request body size for inbound Bitrix24 webhooks (1 MB) */
+const MAX_BODY_BYTES = 1 * 1024 * 1024;
+
+/** Timeout for reading the full inbound webhook body (10 seconds) */
+const BODY_READ_TIMEOUT_MS = 10_000;
+
 /** Bitrix24 disk file IDs start at approximately this value */
 const BITRIX24_FILE_ID_THRESHOLD = 690000;
 
 /** Maximum file size for voice transcription (25MB - OpenAI limit) */
 const MAX_VOICE_FILE_SIZE = 25 * 1024 * 1024;
+
+/** Hard cap for any attachment download to avoid memory blow-ups */
+const MAX_ATTACHMENT_DOWNLOAD_BYTES = 50 * 1024 * 1024;
 
 /** Timeout for external API calls (60 seconds) */
 const EXTERNAL_API_TIMEOUT_MS = 60000;
@@ -129,68 +144,59 @@ export function registerBitrix24Webhook(api: OpenClawPluginApi): void {
  * Parse body from IncomingMessage (handles both JSON and form-urlencoded)
  */
 async function parseBody(req: IncomingMessage): Promise<any> {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    req.on("data", (chunk) => (body += chunk));
-    req.on("end", () => {
-      try {
-        if (!body) {
-          resolve({});
-          return;
-        }
-
-        // Try JSON first
-        if (body.startsWith("{")) {
-          resolve(JSON.parse(body));
-          return;
-        }
-
-        // Parse as form-urlencoded (Bitrix24 format)
-        const params = new URLSearchParams(body);
-        const result: any = { event: "", data: { PARAMS: {}, USER: {}, BOT: {} }, auth: {} };
-
-        for (const [key, value] of params.entries()) {
-          // Handle deeply nested keys like data[PARAMS][MESSAGE]
-          if (key.startsWith("data[PARAMS]")) {
-            const fieldMatch = key.match(/data\[PARAMS\]\[(\w+)\]/);
-            if (fieldMatch) {
-              result.data.PARAMS[fieldMatch[1]] = value;
-            }
-          } else if (key.startsWith("data[USER]")) {
-            const fieldMatch = key.match(/data\[USER\]\[(\w+)\]/);
-            if (fieldMatch) {
-              result.data.USER[fieldMatch[1]] = value;
-            }
-          } else if (key.startsWith("data[BOT]")) {
-            // data[BOT][130387][BOT_ID] format
-            const fieldMatch = key.match(/data\[BOT\]\[\d+\]\[(\w+)\]/);
-            if (fieldMatch) {
-              result.data.BOT[fieldMatch[1]] = value;
-            }
-          } else if (key.startsWith("data[COMMAND]")) {
-            // data[COMMAND][0][COMMAND] format for command events
-            if (!result.data.COMMAND) result.data.COMMAND = {};
-            const fieldMatch = key.match(/data\[COMMAND\]\[\d+\]\[(\w+)\]/);
-            if (fieldMatch) {
-              result.data.COMMAND[fieldMatch[1]] = value;
-            }
-          } else if (key.startsWith("auth[")) {
-            const fieldMatch = key.match(/auth\[(\w+)\]/);
-            if (fieldMatch) {
-              result.auth[fieldMatch[1]] = value;
-            }
-          } else {
-            result[key] = value;
-          }
-        }
-
-        resolve(result);
-      } catch (e) {
-        reject(e);
-      }
-    });
-    req.on("error", reject);
+  const body = await readRequestBody(req, {
+    maxBytes: MAX_BODY_BYTES,
+    timeoutMs: BODY_READ_TIMEOUT_MS,
   });
+
+  if (!body) {
+    return {};
+  }
+
+  const trimmed = body.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    return JSON.parse(trimmed);
+  }
+
+  const params = new URLSearchParams(body);
+  const result: any = { event: "", data: { PARAMS: {}, USER: {}, BOT: {} }, auth: {} };
+
+  for (const [key, value] of params.entries()) {
+    // Handle deeply nested keys like data[PARAMS][MESSAGE]
+    if (key.startsWith("data[PARAMS]")) {
+      const fieldMatch = key.match(/data\[PARAMS\]\[(\w+)\]/);
+      if (fieldMatch) {
+        result.data.PARAMS[fieldMatch[1]] = value;
+      }
+    } else if (key.startsWith("data[USER]")) {
+      const fieldMatch = key.match(/data\[USER\]\[(\w+)\]/);
+      if (fieldMatch) {
+        result.data.USER[fieldMatch[1]] = value;
+      }
+    } else if (key.startsWith("data[BOT]")) {
+      // data[BOT][130387][BOT_ID] format
+      const fieldMatch = key.match(/data\[BOT\]\[\d+\]\[(\w+)\]/);
+      if (fieldMatch) {
+        result.data.BOT[fieldMatch[1]] = value;
+      }
+    } else if (key.startsWith("data[COMMAND]")) {
+      // data[COMMAND][0][COMMAND] format for command events
+      if (!result.data.COMMAND) result.data.COMMAND = {};
+      const fieldMatch = key.match(/data\[COMMAND\]\[\d+\]\[(\w+)\]/);
+      if (fieldMatch) {
+        result.data.COMMAND[fieldMatch[1]] = value;
+      }
+    } else if (key.startsWith("auth[")) {
+      const fieldMatch = key.match(/auth\[(\w+)\]/);
+      if (fieldMatch) {
+        result.auth[fieldMatch[1]] = value;
+      }
+    } else {
+      result[key] = value;
+    }
+  }
+
+  return result;
 }
 
 /**
@@ -220,27 +226,52 @@ async function handleBitrix24Webhook(
       return;
     }
 
-    // Handle different event types
+    // Bitrix24 retries aggressively when webhook responses take too long.
+    // Acknowledge once parsing and basic validation succeed, then process in the background.
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ success: true }));
+
     switch (event.event) {
       case "ONIMMESSAGEADD":
       case "ONIMBOTMESSAGEADD":
-        await handleIncomingMessage(event, secret, log);
+        void handleIncomingMessage(event, secret, log).catch((err) => {
+          log?.error?.(`[Bitrix24] Unhandled error in handleIncomingMessage: ${String(err)}`);
+        });
         break;
 
       case "ONIMCOMMANDADD":
-        await handleIncomingCommand(event, secret, log);
+        void handleIncomingCommand(event, secret, log).catch((err) => {
+          log?.error?.(`[Bitrix24] Unhandled error in handleIncomingCommand: ${String(err)}`);
+        });
         break;
 
       default:
         log?.info?.(`[Bitrix24] Unhandled event type: ${event.event}`);
     }
-
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ success: true }));
   } catch (error) {
-    log?.error?.(`[Bitrix24] Webhook processing error: ${String(error)}`);
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Internal error" }));
+    const statusCode =
+      error instanceof RequestBodyTooLargeError ? 413 :
+      error instanceof RequestBodyTimeoutError ? 408 :
+      typeof (error as { statusCode?: unknown })?.statusCode === "number"
+        ? ((error as { statusCode: number }).statusCode)
+        : 500;
+
+    if (statusCode === 413) {
+      log?.warn?.("[Bitrix24] Rejected oversized webhook body");
+    } else if (statusCode === 408) {
+      log?.warn?.("[Bitrix24] Timed out while reading webhook body");
+    } else {
+      log?.error?.(`[Bitrix24] Webhook processing error: ${String(error)}`);
+    }
+
+    if (!res.headersSent) {
+      const message =
+        statusCode === 413 ? "Payload too large" :
+        statusCode === 408 ? "Request timeout" :
+        "Internal error";
+      res.writeHead(statusCode, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: message }));
+    }
   }
 }
 
@@ -269,18 +300,13 @@ async function verifySecret(secret: string | null, log: any): Promise<{ verified
       return { verified: false, account };
     }
 
-    // Use timing-safe comparison to prevent timing attacks
-    const expected = Buffer.from(account.webhookSecret, "utf8");
-    const received = Buffer.from(secret, "utf8");
-
-    // Length check first (timingSafeEqual requires same length)
-    if (expected.length !== received.length) {
-      log?.warn?.("[Bitrix24] Webhook secret verification failed: length mismatch");
-      return { verified: false, account };
-    }
+    // Compare fixed-length HMAC digests so differing secret lengths do not leak timing information.
+    const key = crypto.randomBytes(32);
+    const expected = crypto.createHmac("sha256", key).update(account.webhookSecret).digest();
+    const received = crypto.createHmac("sha256", key).update(secret).digest();
 
     if (!crypto.timingSafeEqual(expected, received)) {
-      log?.warn?.("[Bitrix24] Webhook secret verification failed: secret mismatch");
+      log?.warn?.("[Bitrix24] Webhook secret verification failed");
       return { verified: false, account };
     }
 
@@ -320,6 +346,11 @@ async function handleIncomingMessage(
   secret: string | null,
   log: any,
 ): Promise<void> {
+  const { verified, account } = await verifySecret(secret, log);
+  if (!verified || !account) {
+    return;
+  }
+
   // Top-level try-catch to ensure we never silently fail
   let fromUserId: string | undefined;
   let userName = "Unknown";
@@ -365,10 +396,6 @@ async function handleIncomingMessage(
     log?.debug?.("[Bitrix24] Skipping bot's own message");
     return;
   }
-
-  // Verify secret
-  const { verified, account } = await verifySecret(secret, log);
-  if (!verified) return;
 
   // Parse attachments from the message
   let attachments: Bitrix24Attachment[] = [];
@@ -577,6 +604,7 @@ async function handleIncomingMessage(
 
   // Reply target (user who sent the message)
   const replyDialogId = fromUserId?.toString() || dialogId || "1";
+  const deliveryGate = createSingleDeliveryGate();
 
   // Dispatch to agent and deliver response with timeout to prevent indefinite hangs
   try {
@@ -599,12 +627,30 @@ async function handleIncomingMessage(
               return;
             }
 
+            let claimed = false;
+            const ensureDeliveryWinner = (label: string): boolean => {
+              if (claimed) {
+                return true;
+              }
+              if (!deliveryGate.claim(label)) {
+                log?.warn?.(
+                  `[Bitrix24] Dropping belated deliver() for ${replyDialogId}; winner is ${deliveryGate.winner()}`,
+                );
+                return false;
+              }
+              claimed = true;
+              return true;
+            };
+
             // Check for media (audio/file) in the payload
             const media = extractMediaFromPayload(payload);
             if (media) {
               log?.info?.(`[Bitrix24] Media detected: ${media.mediaUrl}`);
               try {
                 const isLocalFile = !media.mediaUrl.match(/^https?:\/\//i);
+                if (!ensureDeliveryWinner("agent-response")) {
+                  return;
+                }
                 if (isLocalFile) {
                   const filePath = media.mediaUrl.replace(/^file:\/\//, "");
                   await fileClient.sendFileFromPath({
@@ -630,6 +676,9 @@ async function handleIncomingMessage(
             const finalText = media?.cleanText || rawText;
             if (!finalText?.trim()) {
               log?.warn?.(`[Bitrix24] No text to send after media extraction, skipping`);
+              return;
+            }
+            if (!ensureDeliveryWinner("agent-response")) {
               return;
             }
             log?.info?.(`[Bitrix24] Sending response to ${replyDialogId}: ${finalText.slice(0, 100)}...`);
@@ -660,7 +709,14 @@ async function handleIncomingMessage(
     const userMessage = isTimeout 
       ? `Sorry, processing your message took too long. Please try again or simplify your request.`
       : `Sorry, I encountered an error processing your message.`;
-    
+
+    if (!deliveryGate.claim(isTimeout ? "timeout-apology" : "error-apology")) {
+      log?.warn?.(
+        `[Bitrix24] Skipping fallback message for ${replyDialogId}; winner is ${deliveryGate.winner()}`,
+      );
+      return;
+    }
+
     try {
       await fileClient.sendMessage({
         userId: replyDialogId,
@@ -690,6 +746,11 @@ async function handleIncomingCommand(
   secret: string | null,
   log: any,
 ): Promise<void> {
+  const { verified, account } = await verifySecret(secret, log);
+  if (!verified || !account) {
+    return;
+  }
+
   const { data } = event;
   const runtime = getBitrix24Runtime();
 
@@ -721,10 +782,6 @@ async function handleIncomingCommand(
     log?.debug?.("[Bitrix24] Command event missing required details");
     return;
   }
-
-  // Verify secret
-  const { verified, account } = await verifySecret(secret, log);
-  if (!verified) return;
 
   log?.info?.(`[Bitrix24] Command /${commandName} from ${userName} (${fromUserId}), params: "${commandParams}"`);
 
@@ -793,6 +850,7 @@ async function handleIncomingCommand(
   
   // Show typing indicator for commands too
   const commandDialogId = dialogId || fromUserId?.toString() || "1";
+  const deliveryGate = createSingleDeliveryGate();
   client.sendTyping({ userId: commandDialogId }).catch((err) => {
     log?.debug?.(`[Bitrix24] Command typing indicator failed (non-critical): ${String(err)}`);
   });
@@ -815,16 +873,34 @@ async function handleIncomingCommand(
               return;
             }
 
+            let claimed = false;
+            const ensureDeliveryWinner = (label: string): boolean => {
+              if (claimed) {
+                return true;
+              }
+              if (!deliveryGate.claim(label)) {
+                log?.warn?.(
+                  `[Bitrix24] Dropping belated command deliver() for ${commandDialogId}; winner is ${deliveryGate.winner()}`,
+                );
+                return false;
+              }
+              claimed = true;
+              return true;
+            };
+
             // Check for media in command response
             const media = extractMediaFromPayload(payload);
             if (media) {
               log?.info?.(`[Bitrix24] Command media detected: ${media.mediaUrl}`);
               try {
                 const isLocalFile = !media.mediaUrl.match(/^https?:\/\//i);
+                if (!ensureDeliveryWinner("command-response")) {
+                  return;
+                }
                 if (isLocalFile) {
                   const filePath = media.mediaUrl.replace(/^file:\/\//, "");
                   await client.sendFileFromPath({
-                    userId: dialogId,
+                    userId: commandDialogId,
                     filePath,
                     caption: media.cleanText || undefined,
                     chatId: cmdChatId,
@@ -838,7 +914,10 @@ async function handleIncomingCommand(
             }
 
             const text = media?.cleanText || rawText;
-            log?.info?.(`[Bitrix24] Sending command response to ${dialogId}: ${text.slice(0, 100)}...`);
+            if (!ensureDeliveryWinner("command-response")) {
+              return;
+            }
+            log?.info?.(`[Bitrix24] Sending command response to ${commandDialogId}: ${text.slice(0, 100)}...`);
 
             try {
               if (messageId && (commandId || commandName)) {
@@ -850,7 +929,7 @@ async function handleIncomingCommand(
                 });
               } else {
                 await client.sendMessage({
-                  userId: dialogId,
+                  userId: commandDialogId,
                   text,
                 });
               }
@@ -876,10 +955,17 @@ async function handleIncomingCommand(
     const userMessage = isTimeout
       ? `Sorry, the /${commandName} command took too long to process. Please try again.`
       : `Sorry, I encountered an error processing the /${commandName} command.`;
-    
+
+    if (!deliveryGate.claim(isTimeout ? "command-timeout-apology" : "command-error-apology")) {
+      log?.warn?.(
+        `[Bitrix24] Skipping command fallback for ${commandDialogId}; winner is ${deliveryGate.winner()}`,
+      );
+      return;
+    }
+
     try {
       await client.sendMessage({
-        userId: dialogId,
+        userId: commandDialogId,
         text: userMessage,
       });
     } catch (sendErr) {
@@ -1209,13 +1295,57 @@ async function downloadAndProcessAttachment(
 async function downloadFileFromUrl(url: string, log?: any): Promise<Buffer | null> {
   try {
     log?.debug?.(`[Bitrix24] Starting download from: ${url.slice(0, 50)}...`);
-    const response = await fetch(url);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), EXTERNAL_API_TIMEOUT_MS);
+    let response: Response;
+    try {
+      response = await fetch(url, { signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
     if (!response.ok) {
       log?.warn?.(`[Bitrix24] Download failed: ${response.status} ${response.statusText}`);
       return null;
     }
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
+
+    const contentLength = Number(response.headers.get("content-length") ?? 0);
+    if (contentLength > MAX_ATTACHMENT_DOWNLOAD_BYTES) {
+      log?.warn?.(
+        `[Bitrix24] Rejecting download: Content-Length ${contentLength} exceeds ${MAX_ATTACHMENT_DOWNLOAD_BYTES} byte cap`,
+      );
+      await response.body?.cancel();
+      return null;
+    }
+
+    if (!response.body) {
+      log?.warn?.("[Bitrix24] Download failed: response body is null");
+      return null;
+    }
+
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+    const reader = response.body.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        totalBytes += value.byteLength;
+        if (totalBytes > MAX_ATTACHMENT_DOWNLOAD_BYTES) {
+          await reader.cancel();
+          log?.warn?.(
+            `[Bitrix24] Download aborted mid-stream: exceeded ${MAX_ATTACHMENT_DOWNLOAD_BYTES} byte cap`,
+          );
+          return null;
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    const buffer = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
     log?.debug?.(`[Bitrix24] Downloaded ${buffer.length} bytes`);
     return buffer;
   } catch (err) {
@@ -1246,41 +1376,36 @@ async function analyzeImageAttachment(
     const tempPath = `/tmp/bitrix24_img_${attachment.id}_${Date.now()}.jpg`;
     await fs.writeFile(tempPath, fileBuffer);
     log?.info?.(`[Bitrix24] Saved image to: ${tempPath}`);
-    
-    // Verify file was written
-    const stats = await fs.stat(tempPath);
-    log?.info?.(`[Bitrix24] Image file size on disk: ${stats.size} bytes`);
-    
-    // Try to use OpenClaw's image analysis tool
+
     try {
-      const runtime = getBitrix24Runtime();
-      if (runtime?.tools?.image) {
-        log?.info?.(`[Bitrix24] Calling image analysis tool...`);
-        const result = await runtime.tools.image({
-          image: tempPath,
-          prompt: "Describe what you see in this image in detail."
-        });
-        
-        if (result && typeof result === 'object' && 'text' in result) {
-          const description = (result as any).text;
-          // Clean up temp file asynchronously
-          fs.unlink(tempPath).catch(() => {});
-          return description;
+      // Verify file was written
+      const stats = await fs.stat(tempPath);
+      log?.info?.(`[Bitrix24] Image file size on disk: ${stats.size} bytes`);
+
+      // Try to use OpenClaw's image analysis tool
+      try {
+        const runtime = getBitrix24Runtime();
+        if (runtime?.tools?.image) {
+          log?.info?.(`[Bitrix24] Calling image analysis tool...`);
+          const result = await runtime.tools.image({
+            image: tempPath,
+            prompt: "Describe what you see in this image in detail."
+          });
+
+          if (result && typeof result === "object" && "text" in result) {
+            return (result as any).text;
+          }
+        } else {
+          log?.warn?.(`[Bitrix24] Image analysis tool not available on runtime`);
         }
-      } else {
-        log?.warn?.(`[Bitrix24] Image analysis tool not available on runtime`);
+      } catch (toolErr) {
+        log?.warn?.(`[Bitrix24] Image analysis tool error: ${String(toolErr)}`);
       }
-    } catch (toolErr) {
-      log?.warn?.(`[Bitrix24] Image analysis tool error: ${String(toolErr)}`);
+
+      return `[Image: ${attachment.name} - ${formatFileSize(attachment.size)}]`;
+    } finally {
+      fs.unlink(tempPath).catch(() => {});
     }
-    
-    // Fallback: return file info with note that visual analysis wasn't possible
-    const description = `[Image: ${attachment.name} - ${formatFileSize(attachment.size)} saved to ${tempPath}]`;
-    
-    // Keep the file for manual inspection
-    log?.info?.(`[Bitrix24] Image preserved at: ${tempPath}`);
-    
-    return description;
   } catch (err) {
     log?.error?.(`[Bitrix24] Image analysis failed: ${String(err)}`);
     return `[Image: ${attachment.name}]`;
@@ -1565,7 +1690,7 @@ type ASRProvider = "openai" | "qwen" | "auto";
  */
 async function getOpenAIKey(log?: any): Promise<string | null> {
   try {
-    const homedir = process.env.HOME || process.env.USERPROFILE || '/Users/noonoon';
+    const homedir = process.env.HOME || process.env.USERPROFILE || process.env.HOMEPATH || "/tmp";
     const authPath = `${homedir}/.openclaw/agents/main/agent/auth-profiles.json`;
     
     const authData = await fs.readFile(authPath, 'utf-8');
@@ -1589,22 +1714,27 @@ async function getOpenAIKey(log?: any): Promise<string | null> {
  */
 async function checkQwenReachable(qwenUrl?: string, log?: any): Promise<boolean> {
   try {
-    const { exec } = await import("node:child_process");
-    const { promisify } = await import("node:util");
-    const execAsync = promisify(exec);
+    const baseUrl = new URL(qwenUrl || "http://192.168.2.198:8100/v1/audio/transcriptions");
+    const healthUrl = new URL(baseUrl.origin);
+    const prefix = baseUrl.pathname.replace(/\/v1\/.*$/, "").replace(/\/$/, "");
+    healthUrl.pathname = `${prefix}/health` || "/health";
 
-    // Extract base URL for health check (remove /v1/audio/transcriptions path)
-    const baseUrl = (qwenUrl || "http://192.168.2.198:8100").replace(/\/v1\/.*$/, "");
-
-    // Simple HTTP check with timeout
-    const curlCmd = `curl -s -o /dev/null -w "%{http_code}" --max-time 3 ${baseUrl}/health 2>/dev/null || echo "000"`;
-
-    const { stdout } = await execAsync(curlCmd, { timeout: 5000 });
-    const statusCode = stdout.trim();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5_000);
+    let statusCode = "000";
+    try {
+      const response = await fetch(healthUrl.toString(), {
+        method: "GET",
+        signal: controller.signal,
+      });
+      statusCode = String(response.status);
+    } finally {
+      clearTimeout(timer);
+    }
 
     const isReachable = statusCode === "200" || statusCode === "404"; // 404 is OK if health endpoint doesn't exist
 
-    log?.debug?.(`[Bitrix24] Qwen3-ASR health check ${baseUrl}: HTTP ${statusCode}`);
+    log?.debug?.(`[Bitrix24] Qwen3-ASR health check ${healthUrl}: HTTP ${statusCode}`);
     return isReachable;
   } catch (err) {
     log?.debug?.(`[Bitrix24] Qwen3-ASR reachability check failed: ${String(err)}`);
@@ -1664,18 +1794,17 @@ async function determineASRProvider(
  */
 async function convertToWav(inputPath: string, log?: any): Promise<string | null> {
   try {
-    const { exec } = await import("node:child_process");
+    const { execFile } = await import("node:child_process");
     const { promisify } = await import("node:util");
-    const execAsync = promisify(exec);
+    const execFileAsync = promisify(execFile);
 
     const outputPath = inputPath.replace(/\.[^.]+$/, '.wav');
 
-    // Convert to 16kHz mono WAV (optimal for ASR)
-    const ffmpegCmd = `ffmpeg -i "${inputPath}" -ar 16000 -ac 1 -y "${outputPath}" 2>&1`;
-
     log?.debug?.(`[Bitrix24] Converting audio to WAV: ${inputPath} -> ${outputPath}`);
 
-    const { stdout, stderr } = await execAsync(ffmpegCmd, { timeout: 30000 });
+    await execFileAsync("ffmpeg", ["-i", inputPath, "-ar", "16000", "-ac", "1", "-y", outputPath], {
+      timeout: AUDIO_CONVERSION_TIMEOUT_MS,
+    });
 
     // Check if output file was created
     try {
@@ -1705,9 +1834,9 @@ async function transcribeWithQwen(
   let convertedPath: string | null = null;
 
   try {
-    const { exec } = await import("node:child_process");
+    const { execFile } = await import("node:child_process");
     const { promisify } = await import("node:util");
-    const execAsync = promisify(exec);
+    const execFileAsync = promisify(execFile);
 
     // Qwen3-ASR endpoint - uses local model, no API key needed
     const qwenEndpoint = qwenUrl || "http://192.168.2.198:8100/v1/audio/transcriptions";
@@ -1726,16 +1855,24 @@ async function transcribeWithQwen(
       }
     }
 
-    const curlCmd = `curl -s -X POST "${qwenEndpoint}" \
-      -H "Content-Type: multipart/form-data" \
-      -F file="@${fileToSend}" \
-      -F model="Qwen/Qwen3-ASR-0.6B" \
-      -F response_format="json" \
-      --max-time 60 2>&1`;
-
     log?.info?.(`[Bitrix24] Calling Qwen3-ASR at ${qwenEndpoint}...`);
-    
-    const { stdout } = await execAsync(curlCmd, { timeout: 65000 });
+
+    const { stdout } = await execFileAsync("curl", [
+      "-s",
+      "-X",
+      "POST",
+      qwenEndpoint,
+      "-H",
+      "Content-Type: multipart/form-data",
+      "-F",
+      `file=@${fileToSend}`,
+      "-F",
+      "model=Qwen/Qwen3-ASR-0.6B",
+      "-F",
+      "response_format=json",
+      "--max-time",
+      "60",
+    ], { timeout: 65_000 });
     
     if (stdout) {
       // Qwen3-ASR returns plain text (e.g., "hello world") not JSON
@@ -1822,20 +1959,26 @@ async function transcribeWithOpenAI(
   log?: any
 ): Promise<{ success: boolean; text?: string; error?: string }> {
   try {
-    const { exec } = await import("node:child_process");
+    const { execFile } = await import("node:child_process");
     const { promisify } = await import("node:util");
-    const execAsync = promisify(exec);
-    
-    const curlCmd = `curl -s https://api.openai.com/v1/audio/transcriptions \
-      -H "Authorization: Bearer ${apiKey}" \
-      -H "Content-Type: multipart/form-data" \
-      -F file="@${tempPath}" \
-      -F model="whisper-1" \
-      -F response_format="json" 2>&1`;
-    
+    const execFileAsync = promisify(execFile);
+
     log?.info?.(`[Bitrix24] Calling OpenAI Whisper API...`);
-    
-    const { stdout } = await execAsync(curlCmd, { timeout: 60000 });
+
+    const { stdout } = await execFileAsync("curl", [
+      "-s",
+      "https://api.openai.com/v1/audio/transcriptions",
+      "-H",
+      `Authorization: Bearer ${apiKey}`,
+      "-H",
+      "Content-Type: multipart/form-data",
+      "-F",
+      `file=@${tempPath}`,
+      "-F",
+      "model=whisper-1",
+      "-F",
+      "response_format=json",
+    ], { timeout: 60_000 });
     
     if (stdout) {
       try {
@@ -1884,7 +2027,7 @@ async function transcribeVoiceContent(
       return `[Voice Message: ${attachment.name} - Empty file]`;
     }
 
-    if (fileBuffer.length > 25 * 1024 * 1024) { // OpenAI 25MB limit
+    if (fileBuffer.length > MAX_VOICE_FILE_SIZE) {
       log?.warn?.(`[Bitrix24] Voice file too large: ${fileBuffer.length} bytes`);
       return `[Voice Message: ${attachment.name} - File too large for transcription]`;
     }
@@ -1892,8 +2035,11 @@ async function transcribeVoiceContent(
     // Determine which ASR provider to use
     const { provider, qwenUrl } = await determineASRProvider(accountConfig, globalConfig, log);
 
-    // Save to temp file once
-    tempPath = `/tmp/bitrix24_voice_${attachment.id}_${Date.now()}.mp3`;
+    // Preserve only a safe extension because the temp path is later passed to external tools.
+    const safeVoiceExtensions = new Set([".mp3", ".ogg", ".m4a", ".wav", ".opus", ".flac", ".aac"]);
+    const rawExt = attachment.name.match(/\.[^.]+$/)?.[0]?.toLowerCase() ?? "";
+    const voiceExt = safeVoiceExtensions.has(rawExt) ? rawExt : ".mp3";
+    tempPath = `/tmp/bitrix24_voice_${attachment.id}_${Date.now()}${voiceExt}`;
     await fs.writeFile(tempPath, fileBuffer);
     log?.info?.(`[Bitrix24] Saved voice file: ${tempPath}`);
 

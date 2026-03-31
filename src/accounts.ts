@@ -29,7 +29,7 @@ export function listBitrix24AccountIds(cfg: OpenClawConfig): string[] {
     ids.push(...Object.keys(bitrix24Config.accounts));
   }
   
-  return ids;
+  return [...new Set(ids)];
 }
 
 /**

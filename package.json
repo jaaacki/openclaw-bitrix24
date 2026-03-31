@@ -43,7 +43,7 @@
     "node": ">=18.0.0"
   },
   "scripts": {
-    "test": "echo \"Tests not yet implemented\"",
+    "test": "node --test tests/reliability.test.mjs",
     "lint": "echo \"Linting not yet configured\""
   },
   "openclaw": {
