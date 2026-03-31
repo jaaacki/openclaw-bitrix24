@@ -131,7 +131,17 @@ export function registerBitrix24Webhook(api: OpenClawPluginApi): void {
 async function parseBody(req: IncomingMessage): Promise<any> {
   return new Promise((resolve, reject) => {
     let body = "";
-    req.on("data", (chunk) => (body += chunk));
+    const MAX_BODY_BYTES = 512 * 1024; // 512 KB
+    let bytesRead = 0;
+    req.on("data", (chunk) => {
+      bytesRead += chunk.length;
+      if (bytesRead > MAX_BODY_BYTES) {
+        reject(new Error("Request body exceeds maximum allowed size"));
+        req.destroy();
+        return;
+      }
+      body += chunk;
+    });
     req.on("end", () => {
       try {
         if (!body) {
@@ -320,10 +330,14 @@ async function handleIncomingMessage(
   secret: string | null,
   log: any,
 ): Promise<void> {
+  // AUTH GATE — must be first
+  const { verified, account } = await verifySecret(secret, log);
+  if (!verified) return;
+
   // Top-level try-catch to ensure we never silently fail
   let fromUserId: string | undefined;
   let userName = "Unknown";
-  
+
   try {
     const { data } = event;
     const runtime = getBitrix24Runtime();
@@ -365,10 +379,6 @@ async function handleIncomingMessage(
     log?.debug?.("[Bitrix24] Skipping bot's own message");
     return;
   }
-
-  // Verify secret
-  const { verified, account } = await verifySecret(secret, log);
-  if (!verified) return;
 
   // Parse attachments from the message
   let attachments: Bitrix24Attachment[] = [];

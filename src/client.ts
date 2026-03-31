@@ -122,6 +122,8 @@ export class Bitrix24Client {
     const fullUrl = queryParams.toString() ? `${url}?${queryParams.toString()}` : url;
     this.log?.debug?.(`[Bitrix24] API call: ${method} to ${fullUrl}`);
 
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30_000); // 30s hard limit
     try {
       const response = await fetch(fullUrl, {
         method: "POST",
@@ -129,6 +131,7 @@ export class Bitrix24Client {
           "Accept": "*/*",
           "Content-Length": "0",
         },
+        signal: controller.signal,
       });
 
       if (!response.ok) {
@@ -146,6 +149,8 @@ export class Bitrix24Client {
     } catch (error) {
       this.log?.error?.(`Bitrix24 API call failed: ${method}`, error);
       throw error;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
