@@ -69,6 +69,7 @@ export class Bitrix24Client {
     lastRequestTime: number;
     minWait: number;
   };
+  private _rateLimitChain: Promise<void> = Promise.resolve();
 
   constructor({ domain, webhookSecret, userId, botId, botCode, clientId, log }: Bitrix24ClientOptions) {
     this.domain = domain;
@@ -152,17 +153,20 @@ export class Bitrix24Client {
   /**
    * Rate limiting - wait between requests
    */
-  private async waitForRateLimit(): Promise<void> {
-    const now = Date.now();
-    const elapsed = now - this.rateLimit.lastRequestTime;
-
-    if (elapsed < this.rateLimit.minWait) {
-      const waitTime = this.rateLimit.minWait - elapsed;
-      this.log?.debug?.(`Rate limiting: waiting ${waitTime}ms`);
-      await new Promise((resolve) => setTimeout(resolve, waitTime));
-    }
-
-    this.rateLimit.lastRequestTime = Date.now();
+  private waitForRateLimit(): Promise<void> {
+    const wait = this._rateLimitChain.then(() => {
+      const now = Date.now();
+      const elapsed = now - this.rateLimit.lastRequestTime;
+      if (elapsed < this.rateLimit.minWait) {
+        const waitTime = this.rateLimit.minWait - elapsed;
+        this.log?.debug?.(`Rate limiting: waiting ${waitTime}ms`);
+        return new Promise<void>((resolve) => setTimeout(resolve, waitTime));
+      }
+    }).then(() => {
+      this.rateLimit.lastRequestTime = Date.now();
+    });
+    this._rateLimitChain = wait.catch(() => {});
+    return wait;
   }
 
   /**
@@ -572,12 +576,6 @@ export class Bitrix24Client {
       }
     }
 
-    // Build ATTACH payload
-    const attachPayload: Record<string, any> = {};
-    if (fileIds.length > 0) {
-      attachPayload.MYFILES = fileIds.length === 1 ? fileIds[0] : fileIds;
-    }
-
     // Add URL-based attachments
     const urlAttachments = attachments
       .filter((att) => att.isUrl && att.url)
@@ -590,13 +588,15 @@ export class Bitrix24Client {
       DIALOG_ID: userId,
     };
 
-    if (Object.keys(attachPayload).length > 0) {
-      params.ATTACH = attachPayload;
-    }
-
-    if (urlAttachments.length > 0) {
-      params.ATTACH = params.ATTACH || {};
-      params.ATTACH.URLS = urlAttachments;
+    // Initialize ATTACH once and set both MYFILES and URLS without overwriting
+    if (fileIds.length > 0 || urlAttachments.length > 0) {
+      params.ATTACH = {};
+      if (fileIds.length > 0) {
+        params.ATTACH.MYFILES = fileIds.length === 1 ? fileIds[0] : fileIds;
+      }
+      if (urlAttachments.length > 0) {
+        params.ATTACH.URLS = urlAttachments;
+      }
     }
 
     if (text) {

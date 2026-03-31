@@ -125,14 +125,41 @@ export function registerBitrix24Webhook(api: OpenClawPluginApi): void {
   });
 }
 
+/** Maximum request body size (1 MB) */
+const MAX_BODY_BYTES = 1 * 1024 * 1024;
+
+/** Timeout for reading the full request body (10 seconds) */
+const BODY_READ_TIMEOUT_MS = 10_000;
+
 /**
  * Parse body from IncomingMessage (handles both JSON and form-urlencoded)
  */
 async function parseBody(req: IncomingMessage): Promise<any> {
   return new Promise((resolve, reject) => {
     let body = "";
-    req.on("data", (chunk) => (body += chunk));
+    let byteCount = 0;
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      req.destroy();
+      reject(Object.assign(new Error("Request body read timeout"), { statusCode: 408 }));
+    }, BODY_READ_TIMEOUT_MS);
+
+    req.on("data", (chunk: Buffer) => {
+      byteCount += chunk.length;
+      if (byteCount > MAX_BODY_BYTES) {
+        req.destroy();
+        clearTimeout(timer);
+        reject(Object.assign(new Error("Request body too large"), { statusCode: 413 }));
+        return;
+      }
+      body += chunk.toString();
+    });
+
     req.on("end", () => {
+      if (timedOut) return;
+      clearTimeout(timer);
       try {
         if (!body) {
           resolve({});
@@ -189,7 +216,11 @@ async function parseBody(req: IncomingMessage): Promise<any> {
         reject(e);
       }
     });
-    req.on("error", reject);
+
+    req.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
   });
 }
 
